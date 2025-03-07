@@ -25,6 +25,7 @@ add_llvm_tool(llvm-jitlink
   llvm-jitlink-coff.cpp
   llvm-jitlink-elf.cpp
   llvm-jitlink-macho.cpp
+  llvm-jitlink-xcoff.cpp
   llvm-jitlink-statistics.cpp
 
   EXPORT_SYMBOLS

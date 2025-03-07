@@ -151,6 +151,9 @@ Error registerMachOGraphInfo(Session &S, jitlink::LinkGraph &G);
 /// Record symbols, GOT entries, stubs, and sections for COFF file.
 Error registerCOFFGraphInfo(Session &S, jitlink::LinkGraph &G);
 
+/// Record symbols, TOC entries, and sections for XCOFF file.
+Error registerXCOFFGraphInfo(Session &S, jitlink::LinkGraph &G);
+
 /// Adds a statistics gathering plugin if any stats options are used.
 void enableStatistics(Session &S, bool UsingOrcRuntime);
 
