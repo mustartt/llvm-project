@@ -18,6 +18,7 @@
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/BinaryFormat/XCOFF.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Object/SymbolicFile.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Endian.h"
 #include <limits>
@@ -710,6 +711,9 @@ public:
 
   template <typename Shdr, typename Reloc>
   Expected<ArrayRef<Reloc>> relocations(const Shdr &Sec) const;
+
+  const XCOFFRelocation64 *getRelocation64(DataRefImpl P) const;
+  const XCOFFRelocation32 *getRelocation32(DataRefImpl P) const;
 
   // Loader section related interfaces.
   Expected<StringRef> getImportFileTable() const;

@@ -12,15 +12,17 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/BinaryFormat/XCOFF.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
-#include "llvm/ExecutionEngine/JITLink/ppc64.h"
+#include "llvm/ExecutionEngine/JITLink/ppc.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/XCOFFObjectFile.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdint>
 #include <memory>
 
 using namespace llvm;
@@ -339,6 +341,46 @@ Error XCOFFLinkGraphBuilder::processCsectsAndSymbols() {
   return Error::success();
 }
 
+static Error mapRelocationEdgeKind(object::RelocationRef Ref, Block *B,
+                                   Symbol *S, uint64_t BlockOffset) {
+  using namespace ppc;
+  const auto *Obj = cast<object::XCOFFObjectFile>(Ref.getObject());
+  const object::XCOFFRelocation64 *R =
+      Obj->getRelocation64(Ref.getRawDataRefImpl());
+
+  LLVM_DEBUG(dbgs() << "  Is Relocation signed: " << R->isRelocationSigned()
+                    << "\n");
+
+  switch (Ref.getType()) {
+  case XCOFF::R_POS: {
+    B->addEdge(EdgeKind_ppc::R_POS_64, BlockOffset, *S, 0);
+    break;
+  }
+  case XCOFF::R_TOC: {
+    uint8_t Bits = R->getRelocatedLength();
+    if (Bits == 16) {
+      B->addEdge(EdgeKind_ppc::R_TOC_16, BlockOffset, *S, 0);
+    } else {
+      return make_error<StringError>("Unsupported Relocation R_TOC",
+                                     std::error_code());
+    }
+    break;
+  }
+  case XCOFF::R_RBR: {
+    uint8_t Bits = R->getRelocatedLength();
+    assert(Bits == 26 && "Invalid R_RBR relocation size");
+    B->addEdge(EdgeKind_ppc::R_RBR_26, BlockOffset, *S, 0);
+    break;
+  }
+  default:
+    SmallString<16> RelocType;
+    Ref.getTypeName(RelocType);
+    return make_error<StringError>("Unsupported Relocation Type: " + RelocType,
+                                   std::error_code());
+  }
+  return Error::success();
+}
+
 Error XCOFFLinkGraphBuilder::processRelocations() {
   LLVM_DEBUG(dbgs() << "  Creating relocations...\n");
 
@@ -378,18 +420,11 @@ Error XCOFFLinkGraphBuilder::processRelocations() {
              "Cannot find the target relocation block");
       Block *B = *It;
 
-      auto TargetBlockOffset = Section.getAddress() + Relocation.getOffset() -
-                               B->getAddress().getValue();
-      switch (Relocation.getType()) {
-      case XCOFF::R_POS:
-        B->addEdge(ppc64::EdgeKind_ppc64::Pointer64, TargetBlockOffset, *S, 0);
-        break;
-      default:
-        SmallString<16> RelocType;
-        Relocation.getTypeName(RelocType);
-        return make_error<StringError>(
-            "Unsupported Relocation Type: " + RelocType, std::error_code());
-      }
+      uint64_t TargetBlockOffset = Section.getAddress() +
+                                   Relocation.getOffset() -
+                                   B->getAddress().getValue();
+      if (auto Err = mapRelocationEdgeKind(Relocation, B, S, TargetBlockOffset))
+        return Err;
     }
   }
 

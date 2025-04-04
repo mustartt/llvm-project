@@ -16,6 +16,7 @@
 #include "XCOFFLinkGraphBuilder.h"
 #include "llvm/ADT/bit.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/ppc.h"
 #include "llvm/ExecutionEngine/JITLink/ppc64.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/XCOFFObjectFile.h"
@@ -29,6 +30,7 @@ using namespace llvm;
 
 namespace llvm {
 namespace jitlink {
+using ppc::applyFixup;
 
 Expected<std::unique_ptr<LinkGraph>> createLinkGraphFromXCOFFObject_ppc64(
     MemoryBufferRef ObjectBuffer, std::shared_ptr<orc::SymbolStringPool> SSP) {
@@ -52,7 +54,7 @@ Expected<std::unique_ptr<LinkGraph>> createLinkGraphFromXCOFFObject_ppc64(
 
   return XCOFFLinkGraphBuilder(cast<object::XCOFFObjectFile>(**Obj),
                                std::move(SSP), Triple("powerpc64-ibm-aix"),
-                               std::move(*Features), ppc64::getEdgeKindName)
+                               std::move(*Features), ppc::getEdgeKindName)
       .buildGraph();
 }
 
@@ -73,17 +75,11 @@ public:
   Error applyFixup(LinkGraph &G, Block &B, const Edge &E) const {
     LLVM_DEBUG(dbgs() << "  Applying fixup for " << G.getName()
                       << ", address = " << B.getAddress()
-                      << ", target = " << E.getTarget().getName() << ", kind = "
-                      << ppc64::getEdgeKindName(E.getKind()) << "\n");
-    switch (E.getKind()) {
-    case ppc64::Pointer64:
-      if (auto Err = ppc64::applyFixup<endianness::big>(G, B, E, TOCSymbol))
-        return Err;
-      break;
-    default:
+                      << ", target = " << E.getTarget().getName()
+                      << ", kind = " << G.getEdgeKindName(E.getKind()) << "\n");
+    if (auto Err = ppc::applyFixup(G, B, E, TOCSymbol))
       return make_error<StringError>("Unsupported relocation type",
                                      std::error_code());
-    }
     return Error::success();
   }
 
