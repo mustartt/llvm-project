@@ -36,6 +36,7 @@ add_llvm_component_library(LLVMJITLink
   COFF_x86_64.cpp
 
   # XCOFF
+  ppc.cpp
   XCOFF.cpp
   XCOFF_ppc64.cpp
   XCOFFLinkGraphBuilder.cpp

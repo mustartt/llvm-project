@@ -12,15 +12,17 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/BinaryFormat/XCOFF.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
-#include "llvm/ExecutionEngine/JITLink/ppc64.h"
+#include "llvm/ExecutionEngine/JITLink/ppc.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/XCOFFObjectFile.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdint>
 #include <memory>
 
 using namespace llvm;
@@ -148,8 +150,6 @@ static llvm::StringRef getStorageClassString(XCOFF::StorageClass SC) {
 Error XCOFFLinkGraphBuilder::processSections() {
   LLVM_DEBUG(dbgs() << "  Creating graph sections...\n");
 
-  UndefSection = &G->createSection("*UND*", orc::MemProt::None);
-
   for (object::SectionRef Section : Obj.sections()) {
     auto SectionName = Section.getName();
     if (!SectionName)
@@ -274,14 +274,11 @@ Error XCOFFLinkGraphBuilder::processCsectsAndSymbols() {
     auto CsectSymbolIndex = Obj.getSymbolIndex(CsectSymbol.getEntryAddress());
     auto ParentSectionNumber = CsectSymbol.getSectionNumber();
 
-    bool IsUndefinedSection = !SectionTable.contains(ParentSectionNumber);
-    Section *ParentSection = !IsUndefinedSection
-                                 ? SectionTable[ParentSectionNumber].Section
-                                 : UndefSection;
     Block *B = nullptr;
 
     // TODO: Clean up the logic for handling undefined symbols
-    if (!CsectTable.contains(CsectSymbolIndex) && !IsUndefinedSection) {
+    if (!CsectTable.contains(CsectSymbolIndex) && ParentSectionNumber > 0) {
+      Section *ParentSection = SectionTable[ParentSectionNumber].Section;
       object::SectionRef &SectionRef =
           SectionTable[ParentSectionNumber].SectionData;
       auto Data = SectionRef.getContents();
@@ -339,6 +336,56 @@ Error XCOFFLinkGraphBuilder::processCsectsAndSymbols() {
   return Error::success();
 }
 
+static Error mapRelocationEdgeKind(object::RelocationRef Ref, Block *B,
+                                   Symbol *S, uint64_t BlockOffset) {
+  using namespace ppc;
+  const auto *Obj = cast<object::XCOFFObjectFile>(Ref.getObject());
+  const object::XCOFFRelocation64 *R =
+      Obj->getRelocation64(Ref.getRawDataRefImpl());
+
+  LLVM_DEBUG(dbgs() << "  Is Relocation signed: " << R->isRelocationSigned()
+                    << "\n");
+
+  uint8_t Bits = R->getRelocatedLength();
+  switch (R->Type) {
+  case XCOFF::R_POS: {
+    B->addEdge(EdgeKind_ppc::Pointer64, BlockOffset, *S, 0);
+    break;
+  }
+  case XCOFF::R_TOC: {
+    // TODO: Implement TOC50 for Prefixed Instructions
+    if (Bits != 16)
+      return make_error<JITLinkError>("Unsupported Relocation R_TOC");
+    B->addEdge(EdgeKind_ppc::TOC16, BlockOffset, *S, 0);
+    break;
+  }
+  case XCOFF::R_TOCL: {
+    if (Bits != 16)
+      return make_error<JITLinkError>("Unknown Relocation width for R_TOCL");
+    B->addEdge(EdgeKind_ppc::TOCLower16, BlockOffset, *S, 0);
+    break;
+  }
+  case XCOFF::R_TOCU: {
+    if (Bits != 16)
+      return make_error<JITLinkError>("Unknown Relocation width for R_TOCU");
+    B->addEdge(EdgeKind_ppc::TOCUpper16, BlockOffset, *S, 0);
+    break;
+  }
+  case XCOFF::R_RBR: {
+    if (Bits != 26)
+      return make_error<JITLinkError>("Unknown Relocation width for R_RBR");
+    B->addEdge(EdgeKind_ppc::RelativeBranch, BlockOffset, *S, 0);
+    break;
+  }
+  default:
+    SmallString<16> RelocType;
+    Ref.getTypeName(RelocType);
+    return make_error<StringError>("Unsupported Relocation Type: " + RelocType,
+                                   std::error_code());
+  }
+  return Error::success();
+}
+
 Error XCOFFLinkGraphBuilder::processRelocations() {
   LLVM_DEBUG(dbgs() << "  Creating relocations...\n");
 
@@ -378,18 +425,11 @@ Error XCOFFLinkGraphBuilder::processRelocations() {
              "Cannot find the target relocation block");
       Block *B = *It;
 
-      auto TargetBlockOffset = Section.getAddress() + Relocation.getOffset() -
-                               B->getAddress().getValue();
-      switch (Relocation.getType()) {
-      case XCOFF::R_POS:
-        B->addEdge(ppc64::EdgeKind_ppc64::Pointer64, TargetBlockOffset, *S, 0);
-        break;
-      default:
-        SmallString<16> RelocType;
-        Relocation.getTypeName(RelocType);
-        return make_error<StringError>(
-            "Unsupported Relocation Type: " + RelocType, std::error_code());
-      }
+      uint64_t TargetBlockOffset = Section.getAddress() +
+                                   Relocation.getOffset() -
+                                   B->getAddress().getValue();
+      if (auto Err = mapRelocationEdgeKind(Relocation, B, S, TargetBlockOffset))
+        return Err;
     }
   }
 

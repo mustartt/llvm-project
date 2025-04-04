@@ -45,8 +45,6 @@ private:
   const object::XCOFFObjectFile &Obj;
   std::unique_ptr<LinkGraph> G;
 
-  Section *UndefSection;
-
   struct SectionEntry {
     jitlink::Section *Section;
     object::SectionRef SectionData;
