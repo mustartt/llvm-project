@@ -124,6 +124,10 @@ TEST_F(PPC64XCOFFRelocations, TOCDelta16HI_LO) {
       0xe8, 0x83, 0x00, 0x00, // ld 4, OffsetLO(3)
       0x3c, 0x62, 0x00, 0x00, // addis 3, 2, OffsetHI
       0xe8, 0x83, 0x00, 0x00, // ld 4, OffsetLO(3)
+      0x3c, 0x62, 0x00, 0x00, // addis 3, 2, OffsetHI
+      0xe8, 0x83, 0x00, 0x00, // ld 4, OffsetLO(3)
+      0x3c, 0x62, 0x00, 0x00, // addis 3, 2, OffsetHI
+      0xe8, 0x83, 0x00, 0x00, // ld 4, OffsetLO(3)
   };
   Block &B = createMutableBlock(*TextSection, Content, 0x0);
   Block &TOCBlock = createMutableBlock(*DataSection, {}, 0x5000);
@@ -131,28 +135,43 @@ TEST_F(PPC64XCOFFRelocations, TOCDelta16HI_LO) {
                                      Scope::Local, true, false);
 
   Symbol &PositiveOffset = createSymbolWithDistance(TOCBlock, 0x12340);
-  Edge E1(ppc64::EdgeKind_ppc64::TOCDelta16HI, 2, PositiveOffset, 0);
+  Edge E1(ppc64::EdgeKind_ppc64::TOCDelta16HA, 2, PositiveOffset, 0);
   EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E1, TOC), Succeeded());
   Edge E2(ppc64::EdgeKind_ppc64::TOCDelta16LO, 6, PositiveOffset, 0);
   EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E2, TOC), Succeeded());
 
   Symbol &NegativeOffset = createSymbolWithDistance(TOCBlock, -0x12340);
-  Edge E3(ppc64::EdgeKind_ppc64::TOCDelta16HI, 10, NegativeOffset, 0);
+  Edge E3(ppc64::EdgeKind_ppc64::TOCDelta16HA, 10, NegativeOffset, 0);
   EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E3, TOC), Succeeded());
   Edge E4(ppc64::EdgeKind_ppc64::TOCDelta16LO, 14, NegativeOffset, 0);
   EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E4, TOC), Succeeded());
 
+  Symbol &SmallOffset = createSymbolWithDistance(TOCBlock, 0x20);
+  Edge E5(ppc64::EdgeKind_ppc64::TOCDelta16HA, 18, SmallOffset, 0);
+  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E5, TOC), Succeeded());
+  Edge E6(ppc64::EdgeKind_ppc64::TOCDelta16LO, 22, SmallOffset, 0);
+  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E6, TOC), Succeeded());
+
+  Symbol &SmallNegOffset = createSymbolWithDistance(TOCBlock, -0x20);
+  Edge E7(ppc64::EdgeKind_ppc64::TOCDelta16HA, 26, SmallNegOffset, 0);
+  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E7, TOC), Succeeded());
+  Edge E8(ppc64::EdgeKind_ppc64::TOCDelta16LO, 30, SmallNegOffset, 0);
+  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E8, TOC), Succeeded());
+
   uint8_t ExpectedContent[] = {
       0x3c, 0x62, 0x00, 0x01, // addis 3, 2, 1
       0xe8, 0x83, 0x23, 0x40, // ld 4, 9024(3)
-      0x3c, 0x62, 0xff, 0xfe, // addis 3, 2, -2
+      0x3c, 0x62, 0xff, 0xff, // addis 3, 2, -1
       0xe8, 0x83, 0xdc, 0xc0, // ld 4, -9024(3)
+      0x3c, 0x62, 0x00, 0x00, // addis 3, 2, 0
+      0xe8, 0x83, 0x00, 0x20, // ld 4, 32(3)
+      0x3c, 0x62, 0x00, 0x00, // addis 3, 2, 0
+      0xe8, 0x83, 0xff, 0xe0, // ld 4, -32(3)
   };
   EXPECT_EQ(B.getAlreadyMutableContent(), FromMutable(ExpectedContent));
 
   // Overflow for 32 bit displacements
   Symbol &OutOfRange = createSymbolWithDistance(TOCBlock, 0x80000000);
-  Edge E7(ppc64::EdgeKind_ppc64::TOCDelta16HI, 2, OutOfRange, 0);
-  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E7, TOC), Failed());
+  Edge E9(ppc64::EdgeKind_ppc64::TOCDelta16HA, 2, OutOfRange, 0);
+  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E9, TOC), Failed());
 }
-

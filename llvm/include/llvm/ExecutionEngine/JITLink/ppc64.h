@@ -455,7 +455,7 @@ inline Error applyXCOFFFixup(LinkGraph &G, Block &B, const Edge &E,
     break;
   }
   case TOCDelta16:
-  case TOCDelta16HI:
+  case TOCDelta16HA:
   case TOCDelta16LO: {
     int64_t Value = S + A - TOCBase;
     if (LLVM_UNLIKELY(!isInt<32>(Value)) ||
@@ -478,7 +478,7 @@ inline Error applyXCOFFFixup(LinkGraph &G, Block &B, const Edge &E,
     } else {
       if (LLVM_UNLIKELY(!isInt<32>(Value)))
         return makeTargetOutOfRangeError(G, B, E);
-      Delta = (K == TOCDelta16HI) ? high(Value) : lo(Value);
+      Delta = (K == TOCDelta16HA) ? ha(Value) : lo(Value);
     }
 
     // TODO: If the displacement of the target pointed to by the TOC Entry is

@@ -368,7 +368,7 @@ static Error mapRelocationEdgeKind(object::RelocationRef Ref, Block *B,
   case XCOFF::R_TOCU: {
     if (Bits != 16)
       return make_error<JITLinkError>("Unknown Relocation width for R_TOCU");
-    B->addEdge(EdgeKind_ppc64::TOCDelta16HI, BlockOffset, *S, 0);
+    B->addEdge(EdgeKind_ppc64::TOCDelta16HA, BlockOffset, *S, 0);
     break;
   }
   case XCOFF::R_RBR: {
