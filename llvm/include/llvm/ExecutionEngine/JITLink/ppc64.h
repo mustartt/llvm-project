@@ -313,7 +313,7 @@ private:
     // Create the R_TOC relocation for Offset in the glink stub
     // addis   r12,r2,OffsetHi
     // ld      r12,OffsetLo(r12)
-    StubBlock.addEdge(TOCDelta16HI, 2,
+    StubBlock.addEdge(TOCDelta16HA, 2,
                       G.addAnonymousSymbol(TocEntry, 0, 0, false, true), 0);
     StubBlock.addEdge(TOCDelta16LO, 6,
                       G.addAnonymousSymbol(TocEntry, 0, 0, false, true), 0);
