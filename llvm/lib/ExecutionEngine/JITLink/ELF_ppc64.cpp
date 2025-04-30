@@ -460,7 +460,7 @@ private:
   }
 
   Error applyFixup(LinkGraph &G, Block &B, const Edge &E) const {
-    return ppc64::applyFixup<Endianness>(G, B, E, TOCSymbol);
+    return ppc64::applyELFFixup<Endianness>(G, B, E, TOCSymbol);
   }
 };
 

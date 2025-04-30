@@ -12,7 +12,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/BinaryFormat/XCOFF.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
-#include "llvm/ExecutionEngine/JITLink/ppc.h"
+#include "llvm/ExecutionEngine/JITLink/ppc64.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h"
 #include "llvm/Object/ObjectFile.h"
@@ -338,7 +338,7 @@ Error XCOFFLinkGraphBuilder::processCsectsAndSymbols() {
 
 static Error mapRelocationEdgeKind(object::RelocationRef Ref, Block *B,
                                    Symbol *S, uint64_t BlockOffset) {
-  using namespace ppc;
+  using namespace ppc64;
   const auto *Obj = cast<object::XCOFFObjectFile>(Ref.getObject());
   const object::XCOFFRelocation64 *R =
       Obj->getRelocation64(Ref.getRawDataRefImpl());
@@ -349,32 +349,32 @@ static Error mapRelocationEdgeKind(object::RelocationRef Ref, Block *B,
   uint8_t Bits = R->getRelocatedLength();
   switch (R->Type) {
   case XCOFF::R_POS: {
-    B->addEdge(EdgeKind_ppc::Pointer64, BlockOffset, *S, 0);
+    B->addEdge(EdgeKind_ppc64::Pointer64, BlockOffset, *S, 0);
     break;
   }
   case XCOFF::R_TOC: {
     // TODO: Implement TOC50 for Prefixed Instructions
     if (Bits != 16)
       return make_error<JITLinkError>("Unsupported Relocation R_TOC");
-    B->addEdge(EdgeKind_ppc::TOC16, BlockOffset, *S, 0);
+    B->addEdge(EdgeKind_ppc64::TOCDelta16, BlockOffset, *S, 0);
     break;
   }
   case XCOFF::R_TOCL: {
     if (Bits != 16)
       return make_error<JITLinkError>("Unknown Relocation width for R_TOCL");
-    B->addEdge(EdgeKind_ppc::TOCLower16, BlockOffset, *S, 0);
+    B->addEdge(EdgeKind_ppc64::TOCDelta16LO, BlockOffset, *S, 0);
     break;
   }
   case XCOFF::R_TOCU: {
     if (Bits != 16)
       return make_error<JITLinkError>("Unknown Relocation width for R_TOCU");
-    B->addEdge(EdgeKind_ppc::TOCUpper16, BlockOffset, *S, 0);
+    B->addEdge(EdgeKind_ppc64::TOCDelta16HI, BlockOffset, *S, 0);
     break;
   }
   case XCOFF::R_RBR: {
     if (Bits != 26)
       return make_error<JITLinkError>("Unknown Relocation width for R_RBR");
-    B->addEdge(EdgeKind_ppc::RelativeBranch, BlockOffset, *S, 0);
+    B->addEdge(EdgeKind_ppc64::CallBranchDelta, BlockOffset, *S, 0);
     break;
   }
   default:

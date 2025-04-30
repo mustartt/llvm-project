@@ -13,9 +13,14 @@
 #ifndef LLVM_EXECUTIONENGINE_JITLINK_PPC64_H
 #define LLVM_EXECUTIONENGINE_JITLINK_PPC64_H
 
+#include "llvm/ADT/bit.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/JITLink/TableManager.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/MathExtras.h"
+#include <cstdint>
 
 namespace llvm::jitlink::ppc64 {
 
@@ -64,6 +69,10 @@ enum EdgeKind_ppc64 : Edge::Kind {
   RequestTLSDescInGOTAndTransformToDelta34,
 };
 
+/// Returns a string name for the given ppc64 edge. For debugging purposes
+/// only.
+const char *getEdgeKindName(Edge::Kind K);
+
 enum PLTCallStubKind {
   // Setup function entry(r12) and long branch to target using TOC.
   LongBranch,
@@ -78,6 +87,7 @@ extern const char PointerJumpStubContent_big[20];
 extern const char PointerJumpStubContent_little[20];
 extern const char PointerJumpStubNoTOCContent_big[32];
 extern const char PointerJumpStubNoTOCContent_little[32];
+extern const char GLinkCallStubContent[44];
 
 struct PLTCallStubReloc {
   Edge::Kind K;
@@ -92,14 +102,14 @@ struct PLTCallStubInfo {
 
 template <llvm::endianness Endianness>
 inline PLTCallStubInfo pickStub(PLTCallStubKind StubKind) {
-  constexpr bool isLE = Endianness == llvm::endianness::little;
+  constexpr bool IsLE = Endianness == llvm::endianness::little;
   switch (StubKind) {
   case LongBranch: {
     ArrayRef<char> Content =
-        isLE ? PointerJumpStubContent_little : PointerJumpStubContent_big;
+        IsLE ? PointerJumpStubContent_little : PointerJumpStubContent_big;
     // Skip save r2.
     Content = Content.slice(4);
-    size_t Offset = isLE ? 0 : 2;
+    size_t Offset = IsLE ? 0 : 2;
     return PLTCallStubInfo{
         Content,
         {{TOCDelta16HA, Offset, 0}, {TOCDelta16LO, Offset + 4, 0}},
@@ -107,18 +117,18 @@ inline PLTCallStubInfo pickStub(PLTCallStubKind StubKind) {
   }
   case LongBranchSaveR2: {
     ArrayRef<char> Content =
-        isLE ? PointerJumpStubContent_little : PointerJumpStubContent_big;
-    size_t Offset = isLE ? 4 : 6;
+        IsLE ? PointerJumpStubContent_little : PointerJumpStubContent_big;
+    size_t Offset = IsLE ? 4 : 6;
     return PLTCallStubInfo{
         Content,
         {{TOCDelta16HA, Offset, 0}, {TOCDelta16LO, Offset + 4, 0}},
     };
   }
   case LongBranchNoTOC: {
-    ArrayRef<char> Content = isLE ? PointerJumpStubNoTOCContent_little
+    ArrayRef<char> Content = IsLE ? PointerJumpStubNoTOCContent_little
                                   : PointerJumpStubNoTOCContent_big;
-    size_t Offset = isLE ? 16 : 18;
-    Edge::AddendT Addend = isLE ? 8 : 10;
+    size_t Offset = IsLE ? 16 : 18;
+    Edge::AddendT Addend = IsLE ? 8 : 10;
     return PLTCallStubInfo{
         Content,
         {{Delta16HA, Offset, Addend}, {Delta16LO, Offset + 4, Addend + 4}},
@@ -257,9 +267,74 @@ private:
   PLTCallStubKind StubKind;
 };
 
-/// Returns a string name for the given ppc64 edge. For debugging purposes
-/// only.
-const char *getEdgeKindName(Edge::Kind K);
+class StubTableManager : public TableManager<StubTableManager> {
+public:
+  static StringRef getSectionName() { return "$__STUBS"; }
+
+  bool visitEdge(LinkGraph &G, Block *B, Edge &E) {
+    if (!E.getTarget().isExternal())
+      return false;
+    E.setTarget(this->getEntryForTarget(G, E.getTarget()));
+    E.setKind(CallBranchDeltaRestoreTOC);
+    return true;
+  }
+
+  Symbol &createEntry(LinkGraph &G, Symbol &Target) {
+    return createCallStub(G, getOrCreateStubsSection(G),
+                          getOrCreateDataSection(G), Target);
+  }
+
+private:
+  Section &getOrCreateStubsSection(LinkGraph &G) {
+    StubSection = G.findSectionByName(getSectionName());
+    if (!StubSection)
+      StubSection = &G.createSection(getSectionName(),
+                                     orc::MemProt::Read | orc::MemProt::Exec);
+    return *StubSection;
+  }
+
+  Section &getOrCreateDataSection(LinkGraph &G) {
+    DataSection = G.findSectionByName("$__TOC");
+    if (!DataSection) {
+      DataSection =
+          &G.createSection("$__TOC", orc::MemProt::Read | orc::MemProt::Write);
+      DataSection->setOrdinal(1);
+    }
+    return *DataSection;
+  }
+
+  Symbol &createCallStub(LinkGraph &G, Section &StubSection,
+                         Section &DataSection, Symbol &Target) {
+    Block &StubBlock = G.createContentBlock(StubSection, GLinkCallStubContent,
+                                            orc::ExecutorAddr(), 4, 0);
+    Block &TocEntry = G.createContentBlock(DataSection, NullPointerContent,
+                                           orc::ExecutorAddr(), 4, 0);
+
+    // Create the R_TOC relocation for Offset in the glink stub
+    // addis   r12,r2,OffsetHi
+    // ld      r12,OffsetLo(r12)
+    StubBlock.addEdge(TOCDelta16HI, 2,
+                      G.addAnonymousSymbol(TocEntry, 0, 0, false, true), 0);
+    StubBlock.addEdge(TOCDelta16LO, 6,
+                      G.addAnonymousSymbol(TocEntry, 0, 0, false, true), 0);
+
+    StringRef StubTargetName = *Target.getName();
+    assert(StubTargetName.starts_with(".") &&
+           "Callable stubs must start with .");
+
+    // Create the relocation against the function descriptor in the external
+    // module
+    Symbol &TargetDescriptor =
+        G.addExternalSymbol(StubTargetName.substr(1), 24, false);
+    TocEntry.addEdge(Pointer64, 0, TargetDescriptor, 0);
+
+    return G.addDefinedSymbol(StubBlock, 0, StubTargetName, StubBlock.getSize(),
+                              Linkage::Strong, Scope::Local, true, true);
+  }
+
+  Section *StubSection = nullptr;
+  Section *DataSection = nullptr;
+};
 
 inline static uint16_t ha(uint64_t x) { return (x + 0x8000) >> 16; }
 inline static uint64_t lo(uint64_t x) { return x & 0xffff; }
@@ -352,10 +427,99 @@ inline Error relocateHalf16(char *FixupPtr, int64_t Value, Edge::Kind K) {
   return Error::success();
 }
 
+Expected<uint16_t> getDFormInstructionXOMask(const char *InstPtr);
+
+inline Error applyXCOFFFixup(LinkGraph &G, Block &B, const Edge &E,
+                             const Symbol *TOCSymbol) {
+  char *BlockWorkingMem = B.getAlreadyMutableContent().data();
+  char *FixupPtr = BlockWorkingMem + E.getOffset();
+  orc::ExecutorAddr FixupAddress = B.getAddress() + E.getOffset();
+  int64_t S = E.getTarget().getAddress().getValue();
+  int64_t A = E.getAddend();
+  int64_t P = FixupAddress.getValue();
+  int64_t TOCBase = TOCSymbol ? TOCSymbol->getAddress().getValue() : 0;
+  Edge::Kind K = E.getKind();
+
+  DEBUG_WITH_TYPE("jitlink", {
+    dbgs() << "    Applying fixup on " << G.getEdgeKindName(K)
+           << " edge, (S, A, P, .TOC.) = (" << formatv("{0:x}", S) << ", "
+           << formatv("{0:x}", A) << ", " << formatv("{0:x}", P) << ", "
+           << formatv("{0:x}", TOCBase) << ")\n";
+  });
+
+  // TOOD: Implement the following R_POS R_NEG R_TOC_50 R_TRL R_GL R_TCL R_RBA
+  switch (K) {
+  case Pointer64: {
+    uint64_t Value = S + A;
+    support::endian::write64be(FixupPtr, Value);
+    break;
+  }
+  case TOCDelta16:
+  case TOCDelta16HI:
+  case TOCDelta16LO: {
+    int64_t Value = S + A - TOCBase;
+    if (LLVM_UNLIKELY(!isInt<32>(Value)) ||
+        (K == TOCDelta16 && LLVM_UNLIKELY(!isInt<16>(Value))))
+      return makeTargetOutOfRangeError(G, B, E);
+
+    // A length of 16 is used to specify the displacement field of a D-, DS-,
+    // DQ-, or DX-format instruction. The specified address is the address of
+    // the displacement field. The instruction is examined to preserve low-order
+    // instructions bits that are not part of the displacement field.
+    Expected<uint16_t> XOMask = getDFormInstructionXOMask(FixupPtr - 2);
+    if (!XOMask)
+      return XOMask.takeError();
+
+    int64_t Delta;
+    if (K == TOCDelta16) {
+      if (LLVM_UNLIKELY(!isInt<16>(Value)))
+        return makeTargetOutOfRangeError(G, B, E);
+      Delta = Value;
+    } else {
+      if (LLVM_UNLIKELY(!isInt<32>(Value)))
+        return makeTargetOutOfRangeError(G, B, E);
+      Delta = (K == TOCDelta16HI) ? high(Value) : lo(Value);
+    }
+
+    // TODO: If the displacement of the target pointed to by the TOC Entry is
+    // small enough, we can transfrom the load to an addi r3, r2, Offset
+    uint16_t InstLowerHalf = support::endian::read16be(FixupPtr);
+    support::endian::write16be(FixupPtr,
+                               (InstLowerHalf & *XOMask) | (Delta & ~*XOMask));
+    break;
+  }
+  case CallBranchDeltaRestoreTOC:
+  case CallBranchDelta: {
+    int64_t Value = S + A - P;
+    if (LLVM_UNLIKELY(!isInt<26>(Value)))
+      return makeTargetOutOfRangeError(G, B, E);
+
+    constexpr uint32_t InstMask = 0xfc000003;
+    uint32_t Inst = support::endian::read32<endianness::big>(FixupPtr);
+    support::endian::write32<endianness::big>(
+        FixupPtr, (Inst & InstMask) | (Value & ~InstMask));
+    if (K == CallBranchDeltaRestoreTOC) {
+      uint32_t NopInst = support::endian::read32<endianness::big>(FixupPtr + 4);
+      if (NopInst != 0x60000000)
+        return make_error<JITLinkError>("Cannot fixup relative branch that "
+                                        "retores r2 without nop placeholder");
+      // Restore r2 by instruction 0xe8410028 which is `ld r2, 40(r1)`.
+      support::endian::write32<endianness::big>(FixupPtr + 4, 0xe8410028);
+    }
+    break;
+  }
+  default:
+    return make_error<JITLinkError>(
+        "In graph " + G.getName() + ", section " + B.getSection().getName() +
+        " unsupported edge kind " + getEdgeKindName(E.getKind()));
+  }
+  return Error::success();
+}
+
 /// Apply fixup expression for edge to block content.
 template <llvm::endianness Endianness>
-inline Error applyFixup(LinkGraph &G, Block &B, const Edge &E,
-                        const Symbol *TOCSymbol) {
+inline Error applyELFFixup(LinkGraph &G, Block &B, const Edge &E,
+                           const Symbol *TOCSymbol) {
   char *BlockWorkingMem = B.getAlreadyMutableContent().data();
   char *FixupPtr = BlockWorkingMem + E.getOffset();
   orc::ExecutorAddr FixupAddress = B.getAddress() + E.getOffset();
