@@ -4,6 +4,7 @@
 #include "llvm/ExecutionEngine/Orc/SymbolStringPool.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Testing/Support/Error.h"
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include <cstdint>
 

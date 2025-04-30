@@ -270,7 +270,7 @@ private:
   PLTCallStubKind StubKind;
 };
 
-class StubTableManager : public TableManager<StubTableManager> {
+class GLinkTableManager : public TableManager<GLinkTableManager> {
 public:
   static StringRef getSectionName() { return "$__STUBS"; }
 
