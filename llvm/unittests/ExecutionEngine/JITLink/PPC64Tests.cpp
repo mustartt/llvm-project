@@ -14,10 +14,10 @@ using namespace llvm::jitlink;
 using namespace llvm::support;
 using namespace llvm::support::endian;
 
-static ArrayRef<char> From(ArrayRef<uint8_t> Content) {
+static ArrayRef<char> from(ArrayRef<uint8_t> Content) {
   return {reinterpret_cast<const char *>(Content.data()), Content.size()};
 }
-static MutableArrayRef<char> FromMutable(MutableArrayRef<uint8_t> Content) {
+static MutableArrayRef<char> fromMutable(MutableArrayRef<uint8_t> Content) {
   return {reinterpret_cast<char *>(Content.data()), Content.size()};
 }
 
@@ -48,13 +48,13 @@ public:
 protected:
   Block &createBlock(Section &S, ArrayRef<uint8_t> Content, uint64_t Addr,
                      uint64_t Alignment = 4) {
-    return G->createContentBlock(S, From(Content), orc::ExecutorAddr(Addr),
+    return G->createContentBlock(S, from(Content), orc::ExecutorAddr(Addr),
                                  Alignment, 0);
   }
 
   Block &createMutableBlock(Section &S, MutableArrayRef<uint8_t> Content,
                             uint64_t Addr, uint64_t Alignment = 4) {
-    return G->createMutableContentBlock(S, FromMutable(Content),
+    return G->createMutableContentBlock(S, fromMutable(Content),
                                         orc::ExecutorAddr(Addr), Alignment, 0);
   }
 
@@ -78,7 +78,7 @@ TEST_F(PPC64XCOFFRelocations, Pointer64) {
                     Succeeded());
   uint8_t ExpectedContent[8] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80};
   EXPECT_EQ(TargetBlock.getAlreadyMutableContent(),
-            FromMutable(ExpectedContent));
+            fromMutable(ExpectedContent));
 
   Edge EAddend(ppc64::EdgeKind_ppc64::Pointer64, 0, S, 6);
   EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, TargetBlock, EAddend, nullptr),
@@ -86,7 +86,7 @@ TEST_F(PPC64XCOFFRelocations, Pointer64) {
   uint8_t ExpectedContentAddend[8] = {0x10, 0x20, 0x30, 0x40,
                                       0x50, 0x60, 0x70, 0x86};
   EXPECT_EQ(TargetBlock.getAlreadyMutableContent(),
-            FromMutable(ExpectedContentAddend));
+            fromMutable(ExpectedContentAddend));
 }
 
 TEST_F(PPC64XCOFFRelocations, TOCDelta16) {
@@ -111,7 +111,7 @@ TEST_F(PPC64XCOFFRelocations, TOCDelta16) {
       0xe8, 0x62, 0xff, 0x00, // ld 3, -256(2)
       0xe8, 0x62, 0x01, 0x00, // ld 3, 256(2)
   };
-  EXPECT_EQ(B.getAlreadyMutableContent(), FromMutable(ExpectedContent));
+  EXPECT_EQ(B.getAlreadyMutableContent(), fromMutable(ExpectedContent));
 
   Symbol &OutOfRange = createSymbolWithDistance(TOCBlock, 0xffffff + 1);
   Edge E3(ppc64::EdgeKind_ppc64::TOCDelta16, 6, OutOfRange, 0);
@@ -168,10 +168,52 @@ TEST_F(PPC64XCOFFRelocations, TOCDelta16HI_LO) {
       0x3c, 0x62, 0x00, 0x00, // addis 3, 2, 0
       0xe8, 0x83, 0xff, 0xe0, // ld 4, -32(3)
   };
-  EXPECT_EQ(B.getAlreadyMutableContent(), FromMutable(ExpectedContent));
+  EXPECT_EQ(B.getAlreadyMutableContent(), fromMutable(ExpectedContent));
 
   // Overflow for 32 bit displacements
   Symbol &OutOfRange = createSymbolWithDistance(TOCBlock, 0x80000000);
   Edge E9(ppc64::EdgeKind_ppc64::TOCDelta16HA, 2, OutOfRange, 0);
   EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, B, E9, TOC), Failed());
+}
+
+TEST_F(PPC64XCOFFRelocations, CallBranchDelta) {
+  uint8_t BranchContent[] = {
+      0x48, 0x00, 0x00, 0x01, // bl func
+      0x60, 0x00, 0x00, 0x00, // nop
+  };
+
+  Block &F = createMutableBlock(*TextSection, BranchContent, 0x0);
+  Symbol &Func = createSymbolWithDistance(F, 0x1000);
+
+  Edge E(ppc64::EdgeKind_ppc64::CallBranchDelta, 0, Func, 0);
+  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, F, E, nullptr), Succeeded());
+
+  uint8_t ExpectedContent[] = {
+      0x48, 0x00, 0x10, 0x01, // bl 4096
+      0x60, 0x00, 0x00, 0x00, // nop
+  };
+  EXPECT_EQ(F.getAlreadyMutableContent(), fromMutable(ExpectedContent));
+
+  Symbol &OutOfRange = createSymbolWithDistance(F, 1 << 26);
+  Edge E2(ppc64::EdgeKind_ppc64::CallBranchDelta, 0, OutOfRange, 0);
+  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, F, E2, nullptr), Failed());
+}
+
+TEST_F(PPC64XCOFFRelocations, CallBranchDeltaRestoreTOC) {
+  uint8_t BranchContent[] = {
+      0x48, 0x00, 0x00, 0x01, // bl func
+      0x60, 0x00, 0x00, 0x00, // nop
+  };
+
+  Block &F = createMutableBlock(*TextSection, BranchContent, 0x0);
+  Symbol &Func = createSymbolWithDistance(F, 0x1000);
+
+  Edge E(ppc64::EdgeKind_ppc64::CallBranchDeltaRestoreTOC, 0, Func, 0);
+  EXPECT_THAT_ERROR(ppc64::applyXCOFFFixup(*G, F, E, nullptr), Succeeded());
+
+  uint8_t ExpectedContent[] = {
+      0x48, 0x00, 0x10, 0x01, // bl 4096
+      0xe8, 0x41, 0x00, 0x28, // ld 2, 40(1)
+  };
+  EXPECT_EQ(F.getAlreadyMutableContent(), fromMutable(ExpectedContent));
 }
