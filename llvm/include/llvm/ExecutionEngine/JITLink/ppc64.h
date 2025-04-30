@@ -41,14 +41,17 @@ enum EdgeKind_ppc64 : Edge::Kind {
   Pointer16LO,
   Pointer16LODS,
   Pointer14,
+  NegPointer64,
+  NegPointer32,
   Delta64,
   Delta34,
   Delta32,
-  NegDelta32,
   Delta16,
   Delta16HA,
   Delta16HI,
   Delta16LO,
+  NegDelta64,
+  NegDelta32,
   TOC,
   TOCDelta16,
   TOCDelta16DS,
@@ -447,11 +450,42 @@ inline Error applyXCOFFFixup(LinkGraph &G, Block &B, const Edge &E,
            << formatv("{0:x}", TOCBase) << ")\n";
   });
 
-  // TOOD: Implement the following R_POS R_NEG R_TOC_50 R_TRL R_GL R_TCL R_RBA
+  // TOOD: Implement the following R_TOC_50 R_TRL R_GL R_TCL R_RBA
   switch (K) {
   case Pointer64: {
     uint64_t Value = S + A;
     support::endian::write64be(FixupPtr, Value);
+    break;
+  }
+  case NegPointer64: {
+    uint64_t Value = A - S;
+    support::endian::write64be(FixupPtr, Value);
+    break;
+  }
+  case Pointer32: {
+    int64_t Value = S + A;
+    if (LLVM_UNLIKELY(!isInt<32>(Value)))
+      return makeTargetOutOfRangeError(G, B, E);
+    support::endian::write32be(FixupPtr, Value);
+    break;
+  }
+  case NegPointer32: {
+    int64_t Value = A - S;
+    if (LLVM_UNLIKELY(!isInt<32>(Value)))
+      return makeTargetOutOfRangeError(G, B, E);
+    support::endian::write32be(FixupPtr, Value);
+    break;
+  }
+  case Delta64: {
+    int64_t Value = S + A - P;
+    support::endian::write64be(FixupPtr, Value);
+    break;
+  }
+  case Delta32: {
+    int64_t Value = S + A - P;
+    if (LLVM_UNLIKELY(!isInt<32>(Value)))
+      return makeTargetOutOfRangeError(G, B, E);
+    support::endian::write32be(FixupPtr, Value);
     break;
   }
   case TOCDelta16:

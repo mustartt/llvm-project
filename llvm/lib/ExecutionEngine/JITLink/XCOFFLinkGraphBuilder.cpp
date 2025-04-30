@@ -349,7 +349,30 @@ static Error mapRelocationEdgeKind(object::RelocationRef Ref, Block *B,
   uint8_t Bits = R->getRelocatedLength();
   switch (R->Type) {
   case XCOFF::R_POS: {
-    B->addEdge(EdgeKind_ppc64::Pointer64, BlockOffset, *S, 0);
+    if (Bits == 64)
+      B->addEdge(EdgeKind_ppc64::Pointer64, BlockOffset, *S, 0);
+    else if (Bits == 32)
+      B->addEdge(EdgeKind_ppc64::Pointer32, BlockOffset, *S, 0);
+    else
+      return make_error<JITLinkError>("Unsupported R_POS size");
+    break;
+  }
+  case XCOFF::R_NEG: {
+    if (Bits == 64)
+      B->addEdge(EdgeKind_ppc64::NegPointer64, BlockOffset, *S, 0);
+    else if (Bits == 32)
+      B->addEdge(EdgeKind_ppc64::NegPointer32, BlockOffset, *S, 0);
+    else
+      return make_error<JITLinkError>("Unsupported R_NEG size");
+    break;
+  }
+  case XCOFF::R_REL: {
+    if (Bits == 64)
+      B->addEdge(EdgeKind_ppc64::Delta64, BlockOffset, *S, 0);
+    else if (Bits == 32)
+      B->addEdge(EdgeKind_ppc64::Delta32, BlockOffset, *S, 0);
+    else
+      return make_error<JITLinkError>("Unsupported R_REL size");
     break;
   }
   case XCOFF::R_TOC: {

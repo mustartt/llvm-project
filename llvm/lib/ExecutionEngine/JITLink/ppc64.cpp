@@ -106,14 +106,16 @@ const char *getEdgeKindName(Edge::Kind K) {
     return "Pointer16LODS";
   case Pointer14:
     return "Pointer14";
+  case NegPointer64:
+    return "NegPointer64";
+  case NegPointer32:
+    return "NegPointer32";
   case Delta64:
     return "Delta64";
   case Delta34:
     return "Delta34";
   case Delta32:
     return "Delta32";
-  case NegDelta32:
-    return "NegDelta32";
   case Delta16:
     return "Delta16";
   case Delta16HA:
@@ -122,6 +124,10 @@ const char *getEdgeKindName(Edge::Kind K) {
     return "Delta16HI";
   case Delta16LO:
     return "Delta16LO";
+  case NegDelta64:
+    return "NegDelta64";
+  case NegDelta32:
+    return "NegDelta32";
   case TOC:
     return "TOC";
   case TOCDelta16:
