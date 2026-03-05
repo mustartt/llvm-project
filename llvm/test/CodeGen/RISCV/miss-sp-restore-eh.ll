@@ -24,18 +24,17 @@ define signext i32 @foo() #1 personality ptr @__gxx_personality_v0 {
 ; CHECK-NEXT:    addi s0, sp, 32
 ; CHECK-NEXT:    .cfi_def_cfa s0, 0
 ; CHECK-NEXT:    .cfi_remember_state
-; CHECK-NEXT:  .Ltmp0:
+; CHECK-NEXT:  .Ltmp0: # EH_LABEL
 ; CHECK-NEXT:    addi sp, sp, -32
 ; CHECK-NEXT:    call _Z3fooiiiiiiiiiiPi
 ; CHECK-NEXT:    addi sp, sp, 32
-; CHECK-NEXT:  .Ltmp1:
-; CHECK-NEXT:  # %bb.1: # %try.cont.unreachable
-; CHECK-NEXT:  .LBB0_2: # %lpad
-; CHECK-NEXT:  .Ltmp2:
+; CHECK-NEXT:  .Ltmp1: # EH_LABEL
+; CHECK-NEXT:  .LBB0_1: # %lpad
+; CHECK-NEXT:  .Ltmp2: # EH_LABEL
 ; CHECK-NEXT:    sext.w a1, a1
 ; CHECK-NEXT:    li a2, 1
-; CHECK-NEXT:    bne a1, a2, .LBB0_4
-; CHECK-NEXT:  # %bb.3: # %catch
+; CHECK-NEXT:    bne a1, a2, .LBB0_3
+; CHECK-NEXT:  # %bb.2: # %catch
 ; CHECK-NEXT:    call __cxa_begin_catch
 ; CHECK-NEXT:    lw s1, 0(a0)
 ; CHECK-NEXT:    call __cxa_end_catch
@@ -51,7 +50,7 @@ define signext i32 @foo() #1 personality ptr @__gxx_personality_v0 {
 ; CHECK-NEXT:    addi sp, sp, 32
 ; CHECK-NEXT:    .cfi_def_cfa_offset 0
 ; CHECK-NEXT:    ret
-; CHECK-NEXT:  .LBB0_4: # %ehcleanup
+; CHECK-NEXT:  .LBB0_3: # %ehcleanup
 ; CHECK-NEXT:    .cfi_restore_state
 ; CHECK-NEXT:    call _Unwind_Resume
 entry:

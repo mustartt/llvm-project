@@ -130,13 +130,13 @@ define void @f(ptr nocapture %arg, ptr nocapture %arg1, ptr nocapture %arg2, ptr
 ; CHECK-NEXT:    movl %esi, %ebx
 ; CHECK-NEXT:    calll _OnOverFlow
 ; CHECK-NEXT:  Ltmp6: ## EH_LABEL
-; CHECK-NEXT:    jmp LBB0_3
+; CHECK-NEXT:    ud2
 ; CHECK-NEXT:  LBB0_2: ## %bb29
 ; CHECK-NEXT:  Ltmp7: ## EH_LABEL
 ; CHECK-NEXT:    movl %esi, %ebx
 ; CHECK-NEXT:    calll _OnOverFlow
 ; CHECK-NEXT:  Ltmp8: ## EH_LABEL
-; CHECK-NEXT:  LBB0_3: ## %bb30
+; CHECK-NEXT:  ## %bb.3: ## %bb30
 ; CHECK-NEXT:    ud2
 ; CHECK-NEXT:  LBB0_4: ## %bb20.loopexit
 ; CHECK-NEXT:  Ltmp4: ## EH_LABEL

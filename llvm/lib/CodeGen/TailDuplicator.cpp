@@ -769,7 +769,7 @@ bool TailDuplicator::duplicateSimpleBB(
   SmallVector<MachineBasicBlock *, 8> Preds(TailBB->predecessors());
   bool Changed = false;
   for (MachineBasicBlock *PredBB : Preds) {
-    if (PredBB->hasEHPadSuccessor() || PredBB->mayHaveInlineAsmBr())
+    if (PredBB->mayHaveInlineAsmBr())
       continue;
 
     if (bothUsedInPHI(*PredBB, Succs))

@@ -1099,8 +1099,8 @@ define i32 @test_lp(i32 %a) personality ptr @pers {
 ; CHECK-LABEL: test_lp:
 ; CHECK: %entry
 ; CHECK: %hot
-; CHECK: %then
 ; CHECK: %cold
+; CHECK: %then
 ; CHECK: %coldlp
 ; CHECK: %hotlp
 ; CHECK: %lpret

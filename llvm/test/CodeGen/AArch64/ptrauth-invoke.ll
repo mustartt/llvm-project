@@ -172,14 +172,13 @@ continuebb:
 ; ELF-NEXT:         mov x17, #42
 ; ELF-NEXT:         blrab x19, x17
 ; ELF-NEXT: [[POSTCALL:.L.*]]:
-; ELF-NEXT: // %bb.1:
 ; ELF-NEXT: [[LPADBB:.LBB[0-9_]+]]:
 ; ELF-NEXT: [[LPAD:.L.*]]:
 ; ELF-NEXT:         mov x19, x1
 ; ELF-NEXT:         bl __cxa_begin_catch
 ; ELF-NEXT:         cmp     w19, #2
 ; ELF-NEXT:         b.ne [[EXITBB:.LBB[0-9_]+]]
-; ELF-NEXT: // %bb.3:
+; ELF-NEXT: // %bb.2:
 ; ELF-NEXT:         bl bar
 ; ELF-NEXT: [[EXITBB]]:
 ; ELF-NEXT:         bl foo

@@ -44,7 +44,6 @@ define dso_local noundef i32 @foo() local_unnamed_addr #0 personality ptr @__Cxx
 ; CHECK-NEXT:    movl $123, (%eax)
 ; CHECK-NEXT:    movl $0, -16(%ebp)
 ; CHECK-NEXT:    calll _alwaysthrows
-; CHECK-NEXT:  # %bb.4: # %unreachable.i
 ; CHECK-NEXT:  LBB0_3: # Block address taken
 ; CHECK-NEXT:    # %catch.i
 ; CHECK-NEXT:    addl $12, %ebp

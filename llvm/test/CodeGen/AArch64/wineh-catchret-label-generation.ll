@@ -19,7 +19,7 @@ define fastcc ptr @test_function(i1 %0, ptr %_Fmtfl.i.i, i1 %1) personality ptr 
 ; CHECK-NEXT:    mov x3, #-2 // =0xfffffffffffffffe
 ; CHECK-NEXT:    stur x3, [x29, #16]
 ; CHECK-NEXT:    tbz w0, #0, .LBB0_3
-; CHECK-NEXT:  // %bb.1: // %invoke.cont.i124
+; CHECK-NEXT:  // %bb.1: // %right-block527
 ; CHECK-NEXT:    mov x0, x1
 ; CHECK-NEXT:    b .LBB0_4
 ; CHECK-NEXT:  .LBB0_2: // Block address taken

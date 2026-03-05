@@ -72,7 +72,6 @@ define void @_Z2ami(i32) #0 personality ptr @__gxx_personality_v0 {
 ; CHECK-MINGW-X86-NEXT:    addl $12, %esp
 ; CHECK-MINGW-X86-NEXT:    .cfi_adjust_cfa_offset -12
 ; CHECK-MINGW-X86-NEXT:  Ltmp4:
-; CHECK-MINGW-X86-NEXT:  # %bb.8: # %unreachable
 ; CHECK-MINGW-X86-NEXT:  LBB0_5: # %lpad
 ; CHECK-MINGW-X86-NEXT:  Ltmp2:
 ; CHECK-MINGW-X86-NEXT:    movl %eax, %edi
