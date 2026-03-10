@@ -995,11 +995,8 @@ public:
     assert(
         TheLoop->isInnermost() &&
         "cost-model should not be used for outer loops (in VPlan-native path)");
-    // Pseudo probe needs to be duplicated for each unrolled iteration and
-    // vector lane so that profiled loop trip count can be accurately
-    // accumulated instead of being under counted.
     if (isa<PseudoProbeInst>(I))
-      return false;
+      return true;
 
     if (VF.isScalar())
       return true;
@@ -3213,6 +3210,7 @@ void LoopVectorizationCostModel::collectLoopUniforms(ElementCount VF) {
         case Intrinsic::assume:
         case Intrinsic::lifetime_start:
         case Intrinsic::lifetime_end:
+        case Intrinsic::pseudoprobe:
           if (TheLoop->hasLoopInvariantOperands(&I))
             AddToWorklistIfAllowed(&I);
           break;
@@ -8008,6 +8006,7 @@ VPReplicateRecipe *VPRecipeBuilder::handleReplication(VPInstruction *VPI,
     case Intrinsic::assume:
     case Intrinsic::lifetime_start:
     case Intrinsic::lifetime_end:
+    case Intrinsic::pseudoprobe:
       // For scalable vectors if one of the operands is variant then we still
       // want to mark as uniform, which will generate one instruction for just
       // the first lane of the vector. We can't scalarize the call in the same

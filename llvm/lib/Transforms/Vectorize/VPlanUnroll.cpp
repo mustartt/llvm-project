@@ -681,7 +681,11 @@ void VPlanTransforms::replicateByVF(VPlan &Plan, ElementCount VF) {
     for (VPRecipeBase &R : make_early_inc_range(*VPBB)) {
       if (!isa<VPInstruction, VPReplicateRecipe, VPScalarIVStepsRecipe>(&R) ||
           (isa<VPReplicateRecipe>(&R) &&
-           cast<VPReplicateRecipe>(&R)->isSingleScalar()) ||
+           cast<VPReplicateRecipe>(&R)->isSingleScalar() &&
+           // Pseudoprobes are single scalar but must still be replicated per
+           // vector lane to preserve the original trip count when profiling.
+           !match(cast<VPReplicateRecipe>(&R),
+                  m_Intrinsic(Intrinsic::pseudoprobe))) ||
           (isa<VPInstruction>(&R) &&
            !cast<VPInstruction>(&R)->doesGeneratePerAllLanes() &&
            cast<VPInstruction>(&R)->getOpcode() != VPInstruction::Unpack))
