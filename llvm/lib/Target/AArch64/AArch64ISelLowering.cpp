@@ -11542,7 +11542,8 @@ AArch64TargetLowering::LowerPtrAuthGlobalAddress(SDValue Op,
 // check the sign of the value. It returns the unextended value and
 // the sign bit position.
 std::pair<SDValue, uint64_t> lookThroughSignExtension(SDValue Val) {
-  if (Val.getOpcode() == ISD::SIGN_EXTEND_INREG)
+  if (Val.getOpcode() == ISD::SIGN_EXTEND_INREG ||
+      Val.getOpcode() == ISD::AssertSext)
     return {Val.getOperand(0),
             cast<VTSDNode>(Val.getOperand(1))->getVT().getFixedSizeInBits() -
                 1};
@@ -12422,9 +12423,10 @@ SDValue AArch64TargetLowering::LowerSELECT_CC(
     //                          -> TST %operand, sign_bit; CSEL
     // (SELECT_CC setlt, sign_extend, 0, tval, fval)
     //                          -> TST %operand, sign_bit; CSEL
-    if (CC == ISD::SETLT && RHSC && RHSC->isZero() && LHS.hasOneUse() &&
+    if (CC == ISD::SETLT && RHSC && RHSC->isZero() &&
         (LHS.getOpcode() == ISD::SIGN_EXTEND_INREG ||
-         LHS.getOpcode() == ISD::SIGN_EXTEND)) {
+         LHS.getOpcode() == ISD::SIGN_EXTEND ||
+         LHS.getOpcode() == ISD::AssertSext)) {
 
       uint64_t SignBitPos;
       std::tie(LHS, SignBitPos) = lookThroughSignExtension(LHS);
@@ -12437,6 +12439,35 @@ SDValue AArch64TargetLowering::LowerSELECT_CC(
       SDValue Flags = TST.getValue(1);
       return DAG.getNode(AArch64ISD::CSEL, DL, TVal.getValueType(), TVal, FVal,
                          DAG.getConstant(AArch64CC::NE, DL, MVT::i32), Flags);
+    }
+
+    // Handle sign-extending loads that were folded from sign_extend_inreg.
+    // (SELECT_CC setlt, sextload, 0, tval, fval)
+    //                          -> zextload; TST %zext, sign_bit; CSEL
+    if (CC == ISD::SETLT && RHSC && RHSC->isZero() &&
+        isa<LoadSDNode>(LHS.getNode())) {
+      auto *LN = cast<LoadSDNode>(LHS.getNode());
+      if (LN->getExtensionType() == ISD::SEXTLOAD && LN->isSimple() &&
+          !LN->isIndexed() && LHS.hasOneUse()) {
+        EVT MemVT = LN->getMemoryVT();
+        uint64_t SignBitPos = MemVT.getFixedSizeInBits() - 1;
+        EVT LoadVT = LHS.getValueType();
+
+        SDValue ZLoad =
+            DAG.getExtLoad(ISD::ZEXTLOAD, DL, LoadVT, LN->getChain(),
+                           LN->getBasePtr(), MemVT, LN->getMemOperand());
+        DAG.ReplaceAllUsesOfValueWith(SDValue(LN, 1), ZLoad.getValue(1));
+
+        SDValue SignBitConst = DAG.getConstant(1ULL << SignBitPos, DL, LoadVT);
+        SDValue TST =
+            DAG.getNode(AArch64ISD::ANDS, DL, DAG.getVTList(LoadVT, MVT::i32),
+                        ZLoad, SignBitConst);
+
+        SDValue Flags = TST.getValue(1);
+        return DAG.getNode(AArch64ISD::CSEL, DL, TVal.getValueType(), TVal,
+                           FVal, DAG.getConstant(AArch64CC::NE, DL, MVT::i32),
+                           Flags);
+      }
     }
 
     // Canonicalise absolute difference patterns:
