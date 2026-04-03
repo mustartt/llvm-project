@@ -578,6 +578,9 @@ void MachORewriteInstance::run() {
 
   postProcessFunctions();
 
+  if (opts::BinaryAnalysisMode)
+    return;
+
   runOptimizationPasses();
 
   emitAndLink();

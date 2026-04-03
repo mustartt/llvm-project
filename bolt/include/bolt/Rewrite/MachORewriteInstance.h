@@ -79,6 +79,9 @@ public:
 
   Error setProfile(StringRef FileName);
 
+  /// Return binary context.
+  const BinaryContext &getBinaryContext() const { return *BC; }
+
   /// Run all the necessary steps to read, optimize and rewrite the binary.
   void run();
 };
