@@ -22,6 +22,7 @@
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Regex.h"
+#include <functional>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -82,6 +83,14 @@ public:
   /// If this instance uses a profile, return appropriate profile reader.
   const ProfileReaderBase *getProfileReader() const {
     return ProfileReader.get();
+  }
+
+  /// Progress callback: (phase, current, total). Called during long-running
+  /// phases like disassembly and CFG building.
+  using ProgressCallbackTy =
+      std::function<void(StringRef Phase, unsigned Current, unsigned Total)>;
+  void setProgressCallback(ProgressCallbackTy CB) {
+    ProgressCallback = std::move(CB);
   }
 
 private:
@@ -600,6 +609,9 @@ private:
 
   // Regex object matching split function names.
   const Regex FunctionFragmentTemplate{"(.*)\\.(cold|warm)(\\.[0-9]+)?"};
+
+  /// Optional progress callback for long-running phases.
+  ProgressCallbackTy ProgressCallback;
 
   friend class RewriteInstanceDiff;
 };

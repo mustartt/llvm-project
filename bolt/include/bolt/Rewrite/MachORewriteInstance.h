@@ -16,6 +16,7 @@
 #include "bolt/Core/Linker.h"
 #include "bolt/Utils/NameResolver.h"
 #include "llvm/Support/Error.h"
+#include <functional>
 #include <memory>
 
 namespace llvm {
@@ -84,6 +85,16 @@ public:
 
   /// Run all the necessary steps to read, optimize and rewrite the binary.
   void run();
+
+  /// Progress callback: (phase, current, total).
+  using ProgressCallbackTy =
+      std::function<void(StringRef Phase, unsigned Current, unsigned Total)>;
+  void setProgressCallback(ProgressCallbackTy CB) {
+    ProgressCallback = std::move(CB);
+  }
+
+private:
+  ProgressCallbackTy ProgressCallback;
 };
 
 } // namespace bolt

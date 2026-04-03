@@ -307,8 +307,12 @@ void MachORewriteInstance::discoverFileObjects() {
 }
 
 void MachORewriteInstance::disassembleFunctions() {
+  unsigned Count = 0;
+  unsigned Total = BC->getBinaryFunctions().size();
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
+    if (ProgressCallback)
+      ProgressCallback("Disassembling", ++Count, Total);
     if (!Function.isSimple())
       continue;
     BC->logBOLTErrorsAndQuitOnFatal(Function.disassemble());
@@ -318,8 +322,12 @@ void MachORewriteInstance::disassembleFunctions() {
 }
 
 void MachORewriteInstance::buildFunctionsCFG() {
+  unsigned Count = 0;
+  unsigned Total = BC->getBinaryFunctions().size();
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
+    if (ProgressCallback)
+      ProgressCallback("Building CFG", ++Count, Total);
     if (!Function.isSimple())
       continue;
     BC->logBOLTErrorsAndQuitOnFatal(Function.buildCFG(/*AllocId*/ 0));

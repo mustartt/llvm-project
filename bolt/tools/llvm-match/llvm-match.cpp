@@ -39,6 +39,8 @@
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/ThreadPool.h"
+#include <atomic>
 #include <optional>
 
 #define DEBUG_TYPE "llvm-match"
@@ -72,6 +74,10 @@ static cl::opt<bool>
 static cl::opt<bool>
     DumpFunctions("dump-functions", cl::desc("dump disassembled functions"),
                   cl::Optional, cl::cat(MatchCategory));
+
+static cl::opt<unsigned>
+    ThreadCount("j", cl::desc("number of threads (0 = hardware concurrency)"),
+                cl::init(0), cl::Optional, cl::cat(MatchCategory));
 
 static cl::opt<bool>
     DumpPattern("dump-pattern", cl::desc("print parsed pattern as a graph"),
@@ -1581,6 +1587,11 @@ struct MatchResult {
   SmallVector<NodeID, 8> MatchedNodeIDs; // For graph matcher
 };
 
+struct FunctionResults {
+  std::vector<BBInfo> AllBBs;       // Keeps BBInfo pointers in Matches valid
+  std::vector<MatchResult> Matches;
+};
+
 // Try matching the pattern starting from instruction StartIdx in StartBB,
 // potentially continuing into successor BBs via live-in.
 static bool tryMatch(const BinaryContext &BC,
@@ -2099,53 +2110,109 @@ static void printMatchResult(const BinaryContext &BC, const MatchResult &Result,
 static void runLinearMatcher(const BinaryContext &BC,
                              const std::vector<PatternLine> &Pattern,
                              unsigned &MatchCount) {
-  DenseSet<const MCInst *> AlreadyMatched;
+  SmallVector<const BinaryFunction *, 0> Functions;
+  for (const auto &[Addr, BF] : BC.getBinaryFunctions())
+    Functions.push_back(&BF);
 
-  for (const auto &[Addr, BF] : BC.getBinaryFunctions()) {
-    std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF);
+  std::vector<FunctionResults> AllResults(Functions.size());
+  std::atomic<unsigned> Completed{0};
+  unsigned Total = Functions.size();
+  bool ShowProgress = errs().is_displayed();
 
-    for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
-      for (unsigned InstIdx = 0; InstIdx < AllBBs[BBIdx].Nodes.size();
-           ++InstIdx) {
-        if (AlreadyMatched.count(AllBBs[BBIdx].Nodes[InstIdx].Inst))
-          continue;
-        MatchResult Result;
-        if (tryMatch(BC, Pattern, AllBBs, BBIdx, InstIdx, Result)) {
-          const auto &[FirstBI, FirstIdx] = Result.MatchedInstrs.front();
-          AlreadyMatched.insert(FirstBI->Nodes[FirstIdx].Inst);
-          Result.FunctionName = BF.getPrintName();
-          printMatchResult(BC, Result, ++MatchCount);
+  DefaultThreadPool Pool(hardware_concurrency(opts::ThreadCount));
+  for (unsigned FIdx = 0; FIdx < Functions.size(); ++FIdx) {
+    Pool.async([&BC, &Pattern, &Functions, &AllResults, &Completed, Total,
+                ShowProgress, FIdx] {
+      const BinaryFunction &BF = *Functions[FIdx];
+      std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF);
+      DenseSet<const MCInst *> LocalMatched;
+
+      for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
+        for (unsigned InstIdx = 0; InstIdx < AllBBs[BBIdx].Nodes.size();
+             ++InstIdx) {
+          if (LocalMatched.count(AllBBs[BBIdx].Nodes[InstIdx].Inst))
+            continue;
+          MatchResult Result;
+          if (tryMatch(BC, Pattern, AllBBs, BBIdx, InstIdx, Result)) {
+            const auto &[FirstBI, FirstIdx] = Result.MatchedInstrs.front();
+            LocalMatched.insert(FirstBI->Nodes[FirstIdx].Inst);
+            Result.FunctionName = BF.getPrintName();
+            AllResults[FIdx].Matches.push_back(std::move(Result));
+          }
         }
       }
-    }
+
+      AllResults[FIdx].AllBBs = std::move(AllBBs);
+
+      if (ShowProgress) {
+        unsigned Done = ++Completed;
+        fprintf(stderr, "\rMatching: %u/%u functions (%u%%)", Done, Total,
+                Done * 100 / Total);
+        fflush(stderr);
+      }
+    });
   }
+  Pool.wait();
+  if (ShowProgress)
+    fprintf(stderr, "\r\033[K");
+
+  for (const auto &FR : AllResults)
+    for (const auto &Result : FR.Matches)
+      printMatchResult(BC, Result, ++MatchCount);
 }
 
 static void runGraphMatcher(const BinaryContext &BC,
                             const std::vector<PatternLine> &Pattern,
                             unsigned RootPatIdx,
                             unsigned &MatchCount) {
-  DenseSet<const MCInst *> AlreadyMatched;
+  SmallVector<const BinaryFunction *, 0> Functions;
+  for (const auto &[Addr, BF] : BC.getBinaryFunctions())
+    Functions.push_back(&BF);
 
-  for (const auto &[Addr, BF] : BC.getBinaryFunctions()) {
-    std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF);
-    DefUseGraph G = buildDefUseGraph(AllBBs);
+  std::vector<FunctionResults> AllResults(Functions.size());
+  std::atomic<unsigned> Completed{0};
+  unsigned Total = Functions.size();
+  bool ShowProgress = errs().is_displayed();
 
-    // Try every node as a potential root.
-    for (NodeID NID = 0; NID < G.Nodes.size(); ++NID) {
-      if (AlreadyMatched.count(G.Nodes[NID].Inst))
-        continue;
+  DefaultThreadPool Pool(hardware_concurrency(opts::ThreadCount));
+  for (unsigned FIdx = 0; FIdx < Functions.size(); ++FIdx) {
+    Pool.async([&BC, &Pattern, RootPatIdx, &Functions, &AllResults, &Completed,
+                Total, ShowProgress, FIdx] {
+      const BinaryFunction &BF = *Functions[FIdx];
+      std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF);
+      DefUseGraph G = buildDefUseGraph(AllBBs);
+      DenseSet<const MCInst *> LocalMatched;
 
-      MatchResult Result;
-      if (tryGraphMatch(BC, Pattern, RootPatIdx, G, AllBBs, NID, Result)) {
-        // Mark all matched instructions to avoid overlapping matches.
-        for (const auto &[BI, Idx] : Result.MatchedInstrs)
-          AlreadyMatched.insert(BI->Nodes[Idx].Inst);
-        Result.FunctionName = BF.getPrintName();
-        printMatchResult(BC, Result, ++MatchCount);
+      for (NodeID NID = 0; NID < G.Nodes.size(); ++NID) {
+        if (LocalMatched.count(G.Nodes[NID].Inst))
+          continue;
+
+        MatchResult Result;
+        if (tryGraphMatch(BC, Pattern, RootPatIdx, G, AllBBs, NID, Result)) {
+          for (const auto &[BI, Idx] : Result.MatchedInstrs)
+            LocalMatched.insert(BI->Nodes[Idx].Inst);
+          Result.FunctionName = BF.getPrintName();
+          AllResults[FIdx].Matches.push_back(std::move(Result));
+        }
       }
-    }
+
+      AllResults[FIdx].AllBBs = std::move(AllBBs);
+
+      if (ShowProgress) {
+        unsigned Done = ++Completed;
+        fprintf(stderr, "\rMatching: %u/%u functions (%u%%)", Done, Total,
+                Done * 100 / Total);
+        fflush(stderr);
+      }
+    });
   }
+  Pool.wait();
+  if (ShowProgress)
+    fprintf(stderr, "\r\033[K");
+
+  for (const auto &FR : AllResults)
+    for (const auto &Result : FR.Matches)
+      printMatchResult(BC, Result, ++MatchCount);
 }
 
 static void runMatcher(const BinaryContext &BC,
@@ -2330,13 +2397,34 @@ static void processBinaryContext(const BinaryContext &BC,
     runMatcher(BC, Pattern);
 }
 
+static auto makeProgressCallback() {
+  bool Show = errs().is_displayed();
+  return [Show](StringRef Phase, unsigned Current, unsigned Total) {
+    if (!Show)
+      return;
+    fprintf(stderr, "\r%s: %u/%u functions (%u%%)", Phase.data(), Current,
+            Total, Total ? Current * 100 / Total : 0);
+    fflush(stderr);
+  };
+}
+
+static void clearProgress() {
+  if (errs().is_displayed())
+    fprintf(stderr, "\r\033[K");
+}
+
 static void processMachO(MachOObjectFile *MachOObj, StringRef ToolPath,
                           const std::vector<PatternLine> &Pattern) {
   auto MachORIOrErr = MachORewriteInstance::create(MachOObj, ToolPath);
   if (Error E = MachORIOrErr.takeError())
     report_error(opts::InputFilename, std::move(E));
   MachORewriteInstance &MachORI = *MachORIOrErr.get();
+  MachORI.setProgressCallback(makeProgressCallback());
   MachORI.run();
+  clearProgress();
+  if (errs().is_displayed())
+    fprintf(stderr, "Loaded %zu functions\n",
+            MachORI.getBinaryContext().getBinaryFunctions().size());
   processBinaryContext(MachORI.getBinaryContext(), Pattern);
 }
 
@@ -2410,8 +2498,13 @@ int main(int argc, char **argv) {
     if (Error E = RIOrErr.takeError())
       report_error(opts::InputFilename, std::move(E));
     RewriteInstance &RI = *RIOrErr.get();
+    RI.setProgressCallback(makeProgressCallback());
     if (Error E = RI.run())
       report_error(opts::InputFilename, std::move(E));
+    clearProgress();
+    if (errs().is_displayed())
+      fprintf(stderr, "Loaded %zu functions\n",
+              RI.getBinaryContext().getBinaryFunctions().size());
     processBinaryContext(RI.getBinaryContext(), Pattern);
   } else if (auto *MachOObj = dyn_cast<MachOObjectFile>(&Binary)) {
     processMachO(MachOObj, ToolPath, Pattern);

@@ -60,6 +60,7 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -3656,8 +3657,13 @@ void RewriteInstance::processProfileData() {
 void RewriteInstance::disassembleFunctions() {
   NamedRegionTimer T("disassembleFunctions", "disassemble functions",
                      TimerGroupName, TimerGroupDesc, opts::TimeRewrite);
+  unsigned Count = 0;
+  unsigned Total = BC->getBinaryFunctions().size();
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
+
+    if (ProgressCallback)
+      ProgressCallback("Disassembling", ++Count, Total);
 
     ErrorOr<ArrayRef<uint8_t>> FunctionData = Function.getData();
     if (!FunctionData) {
@@ -3791,6 +3797,9 @@ void RewriteInstance::buildFunctionsCFG() {
   BC->MIB->getOrCreateAnnotationIndex("JTIndexReg");
   BC->MIB->getOrCreateAnnotationIndex("NOP");
 
+  std::atomic<unsigned> CFGCount{0};
+  unsigned CFGTotal = BC->getBinaryFunctions().size();
+
   ParallelUtilities::WorkFuncWithAllocTy WorkFun =
       [&](BinaryFunction &BF, MCPlusBuilder::AllocatorIdTy AllocId) {
         bool HadErrors{false};
@@ -3808,6 +3817,11 @@ void RewriteInstance::buildFunctionsCFG() {
         if (opts::PrintAll) {
           auto L = BC->scopeLock();
           BF.print(BC->outs(), "while building cfg");
+        }
+
+        if (ProgressCallback) {
+          unsigned Done = ++CFGCount;
+          ProgressCallback("Building CFG", Done, CFGTotal);
         }
       };
 
