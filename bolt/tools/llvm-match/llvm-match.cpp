@@ -208,7 +208,8 @@ struct DefUseGraph {
   DenseMap<NodeID, SmallVector<unsigned, 4>> InEdges;  // edges where node is Use
 };
 
-static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs) {
+static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs,
+                                    const MCRegisterInfo &MRI) {
   DefUseGraph G;
 
   // Step 1: Flatten all InstrNodes, record BB start offsets.
@@ -218,42 +219,47 @@ static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs) {
       G.Nodes.push_back(N);
   }
 
-  // Step 2: Within each BB, track last definer per register.
+  // Step 2: Within each BB, track last definer per register unit.
+  // Using register units instead of MCPhysReg handles aliasing:
+  // W0/X0 share a regunit, as do Q0/V0/D0/S0/B0/H0.
   // Store per-BB last-def maps for cross-BB edges.
-  std::vector<DenseMap<MCPhysReg, NodeID>> PerBBLastDef(AllBBs.size());
+  std::vector<DenseMap<unsigned, NodeID>> PerBBLastDef(AllBBs.size());
 
   for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
     unsigned Start = G.BBStart[BBIdx];
     unsigned End = (BBIdx + 1 < AllBBs.size()) ? G.BBStart[BBIdx + 1]
                                                 : G.Nodes.size();
-    DenseMap<MCPhysReg, NodeID> LastDef;
+    DenseMap<unsigned, NodeID> LastDef;
 
     for (unsigned NID = Start; NID < End; ++NID) {
       const InstrNode &Node = G.Nodes[NID];
 
-      // Add edges: for each use, if there's a last definer, add edge.
+      // Add edges: for each use register, check if any of its regunits
+      // has a last definer.  Use a set to avoid duplicate edges to the
+      // same definer.
+      DenseSet<NodeID> SeenDefs;
       for (MCPhysReg Reg : Node.Uses) {
-        auto It = LastDef.find(Reg);
-        if (It != LastDef.end()) {
-          unsigned EIdx = G.Edges.size();
-          G.Edges.push_back({It->second, NID, Reg});
-          G.OutEdges[It->second].push_back(EIdx);
-          G.InEdges[NID].push_back(EIdx);
+        for (MCRegUnit RU : MRI.regunits(Reg)) {
+          auto It = LastDef.find(static_cast<unsigned>(RU));
+          if (It != LastDef.end() && SeenDefs.insert(It->second).second) {
+            unsigned EIdx = G.Edges.size();
+            G.Edges.push_back({It->second, NID, Reg});
+            G.OutEdges[It->second].push_back(EIdx);
+            G.InEdges[NID].push_back(EIdx);
+          }
         }
       }
 
-      // Update last definer for each def.
+      // Update last definer for each regunit of each def.
       for (MCPhysReg Reg : Node.Defs)
-        LastDef[Reg] = NID;
+        for (MCRegUnit RU : MRI.regunits(Reg))
+          LastDef[static_cast<unsigned>(RU)] = NID;
     }
 
     PerBBLastDef[BBIdx] = std::move(LastDef);
   }
 
-  // Step 3: Cross-BB edges. For each BB, for each predecessor, if a register
-  // is used in this BB before being defined (i.e., live-in), connect from
-  // the predecessor's last definer.
-  // Build BB pointer → index map.
+  // Step 3: Cross-BB edges.
   DenseMap<const BinaryBasicBlock *, unsigned> BBPtrToIdx;
   for (unsigned I = 0; I < AllBBs.size(); ++I)
     BBPtrToIdx[AllBBs[I].BB] = I;
@@ -264,32 +270,43 @@ static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs) {
                                                 : G.Nodes.size();
 
     // Find registers used before being defined in this BB (live-in uses).
-    DenseSet<MCPhysReg> DefinedSoFar;
+    DenseSet<unsigned> DefinedSoFar;
     SmallVector<std::pair<MCPhysReg, NodeID>, 8> LiveInUses;
 
     for (unsigned NID = Start; NID < End; ++NID) {
       const InstrNode &Node = G.Nodes[NID];
       for (MCPhysReg Reg : Node.Uses) {
-        if (!DefinedSoFar.count(Reg))
+        bool AllDefined = true;
+        for (MCRegUnit RU : MRI.regunits(Reg)) {
+          if (!DefinedSoFar.count(static_cast<unsigned>(RU))) {
+            AllDefined = false;
+            break;
+          }
+        }
+        if (!AllDefined)
           LiveInUses.push_back({Reg, NID});
       }
       for (MCPhysReg Reg : Node.Defs)
-        DefinedSoFar.insert(Reg);
+        for (MCRegUnit RU : MRI.regunits(Reg))
+          DefinedSoFar.insert(static_cast<unsigned>(RU));
     }
 
-    // For each live-in use, find definer in predecessor BBs.
+    // For each live-in use, find definer in predecessor BBs via regunits.
     for (const auto &[Reg, UseNID] : LiveInUses) {
       for (const BinaryBasicBlock *Pred : AllBBs[BBIdx].BB->predecessors()) {
         auto PredIt = BBPtrToIdx.find(Pred);
         if (PredIt == BBPtrToIdx.end())
           continue;
         unsigned PredIdx = PredIt->second;
-        auto DefIt = PerBBLastDef[PredIdx].find(Reg);
-        if (DefIt != PerBBLastDef[PredIdx].end()) {
-          unsigned EIdx = G.Edges.size();
-          G.Edges.push_back({DefIt->second, UseNID, Reg});
-          G.OutEdges[DefIt->second].push_back(EIdx);
-          G.InEdges[UseNID].push_back(EIdx);
+        for (MCRegUnit RU : MRI.regunits(Reg)) {
+          auto DefIt = PerBBLastDef[PredIdx].find(static_cast<unsigned>(RU));
+          if (DefIt != PerBBLastDef[PredIdx].end()) {
+            unsigned EIdx = G.Edges.size();
+            G.Edges.push_back({DefIt->second, UseNID, Reg});
+            G.OutEdges[DefIt->second].push_back(EIdx);
+            G.InEdges[UseNID].push_back(EIdx);
+            break; // One edge per (pred, use) pair is enough.
+          }
         }
       }
     }
@@ -1323,11 +1340,65 @@ static void dumpPatternDot(const std::vector<PatternLine> &Pattern,
 }
 
 
+// Check if an operand text names a register that aliases the bound register.
+// Since printed names may use alternate forms (e.g., "v0" for Q0 on AArch64),
+// we resolve the text to an MCPhysReg via the InstrNode's MCInst operands
+// and then compare via register units.
+static bool regTextMatchesBinding(const BinaryContext &BC, StringRef Text,
+                                  MCPhysReg BoundReg,
+                                  const InstrNode *Node = nullptr) {
+  // Direct name match.
+  if (Text.equals_insensitive(BC.MRI->getName(BoundReg)))
+    return true;
+  // Check sub/super registers by canonical name.
+  for (MCPhysReg Sub : BC.MRI->subregs(BoundReg))
+    if (Text.equals_insensitive(BC.MRI->getName(Sub)))
+      return true;
+  for (MCPhysReg Super : BC.MRI->superregs(BoundReg))
+    if (Text.equals_insensitive(BC.MRI->getName(Super)))
+      return true;
+
+  // If we have the MCInst, resolve the printed text to an MCPhysReg by
+  // finding an operand whose printed name matches, then check regunit overlap.
+  if (Node && Node->Inst) {
+    for (unsigned I = 0, E = Node->Inst->getNumOperands(); I < E; ++I) {
+      const MCOperand &Op = Node->Inst->getOperand(I);
+      if (!Op.isReg() || Op.getReg() == 0)
+        continue;
+      MCPhysReg CandReg = Op.getReg();
+      if (CandReg == BoundReg)
+        return true;
+      // Check regunit overlap (covers Q0 == Q0 for v0/q0 alternate names).
+      bool Aliases = false;
+      for (MCRegUnit RU : BC.MRI->regunits(CandReg)) {
+        for (MCRegUnit BRU : BC.MRI->regunits(BoundReg)) {
+          if (RU == BRU) {
+            Aliases = true;
+            break;
+          }
+        }
+        if (Aliases)
+          break;
+      }
+      if (!Aliases)
+        continue;
+      // CandReg aliases BoundReg. Now verify this is the operand the text
+      // refers to by checking if CandReg is the ONLY register operand that
+      // could produce this text (or just accept it — the mnemonic + position
+      // matching in matchLine already constrains this sufficiently).
+      return true;
+    }
+  }
+  return false;
+}
+
 // Try to bind a pattern operand against a parsed assembly operand.
-// Returns false if binding fails.
+// OpIdx is the position of this operand in the instruction (used for
+// positional register lookup when name-based lookup fails due to alt names).
 static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
                            const AsmOperand &AsmOp, const InstrNode &Node,
-                           StringMap<Binding> &Bindings) {
+                           StringMap<Binding> &Bindings,
+                           unsigned OpIdx = ~0u) {
   if (PO.K == PatternOperand::Literal)
     return true; // Literals are hints, always pass.
 
@@ -1475,8 +1546,7 @@ static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
         // Back-reference: verify match.
         const Binding &B = It->second;
         if (B.K == Binding::Reg) {
-          StringRef BoundName = BC.MRI->getName(B.RegVal);
-          return WorkToken.equals_insensitive(BoundName);
+          return regTextMatchesBinding(BC, WorkToken, B.RegVal, &Node);
         }
         if (B.K == Binding::Imm) {
           StringRef NumStr = WorkToken;
@@ -1497,15 +1567,25 @@ static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
         return false;
       }
       // Not yet bound — try to capture as register first, then label.
+      // First try name-based lookup, then positional MCInst operand lookup
+      // (handles alternate names like v0/q0 on AArch64).
       MCPhysReg FoundReg = 0;
       for (unsigned I = 0, E = Node.Inst->getNumOperands(); I < E; ++I) {
         const MCOperand &Op = Node.Inst->getOperand(I);
-        if (Op.isReg() && Op.getReg() != 0) {
-          if (WorkToken.equals_insensitive(BC.MRI->getName(Op.getReg()))) {
-            FoundReg = Op.getReg();
-            break;
-          }
+        if (!Op.isReg() || Op.getReg() == 0)
+          continue;
+        MCPhysReg CandReg = Op.getReg();
+        if (WorkToken.equals_insensitive(BC.MRI->getName(CandReg))) {
+          FoundReg = CandReg;
+          break;
         }
+      }
+      // Positional fallback: if the operand index is valid, use the MCInst
+      // register at that position directly.
+      if (FoundReg == 0 && OpIdx != ~0u && OpIdx < Node.Inst->getNumOperands()) {
+        const MCOperand &Op = Node.Inst->getOperand(OpIdx);
+        if (Op.isReg() && Op.getReg() != 0)
+          FoundReg = Op.getReg();
       }
       if (FoundReg != 0) {
         Binding B;
@@ -1535,20 +1615,24 @@ static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
     if (It != Bindings.end()) {
       if (It->second.K != Binding::Reg)
         return false;
-      StringRef BoundName = BC.MRI->getName(It->second.RegVal);
-      if (!RegName.equals_insensitive(BoundName))
+      if (!regTextMatchesBinding(BC, RegName, It->second.RegVal, &Node))
         return false;
     } else {
-      // Look up the register by name in MCInst operands.
+      // Look up the register by name in MCInst operands, with positional fallback.
       MCPhysReg FoundReg = 0;
       for (unsigned I = 0, E = Node.Inst->getNumOperands(); I < E; ++I) {
         const MCOperand &Op = Node.Inst->getOperand(I);
-        if (Op.isReg() && Op.getReg() != 0) {
-          if (RegName.equals_insensitive(BC.MRI->getName(Op.getReg()))) {
-            FoundReg = Op.getReg();
-            break;
-          }
+        if (!Op.isReg() || Op.getReg() == 0)
+          continue;
+        if (RegName.equals_insensitive(BC.MRI->getName(Op.getReg()))) {
+          FoundReg = Op.getReg();
+          break;
         }
+      }
+      if (FoundReg == 0 && OpIdx != ~0u && OpIdx < Node.Inst->getNumOperands()) {
+        const MCOperand &Op = Node.Inst->getOperand(OpIdx);
+        if (Op.isReg() && Op.getReg() != 0)
+          FoundReg = Op.getReg();
       }
       if (FoundReg == 0)
         return false;
@@ -1578,6 +1662,7 @@ static bool regMatchesBinding(const BinaryContext &BC, MCPhysReg Reg,
       return true;
   return false;
 }
+
 
 // Try to match a single PatternLine against an InstrNode.
 // Updates Bindings on success, returns false on failure.
@@ -1627,7 +1712,7 @@ static bool matchLine(const BinaryContext &BC, const PatternLine &PL,
     if (PL.Operands[I].K == PatternOperand::Capture &&
         PL.Operands[I].Type == "nzcv")
       continue;
-    if (!tryBindOperand(BC, PL.Operands[I], AsmOps[I], Node, Bindings))
+    if (!tryBindOperand(BC, PL.Operands[I], AsmOps[I], Node, Bindings, I))
       return false;
   }
 
@@ -2133,6 +2218,426 @@ static bool validateConstraints(
   return true;
 }
 
+// ===----------------------------------------------------------------------===//
+// DP-based graph matcher
+// ===----------------------------------------------------------------------===//
+//
+// Instead of trying every root candidate and searching per-root, we process
+// pattern lines bottom-up in topological order (leaves first).  Each
+// instruction is checked at most once per pattern line, and predecessor
+// constraints are verified via def-use edges against already-computed labels.
+//
+// For a pattern like:
+//   ldr %base:xreg, _          (p0, leaf)
+//   ldr %idx:xreg, _           (p1, leaf)
+//   lsl %off:xreg, %idx, _     (p2, depends on p1)
+//   root ldr _, [%base, %off]   (p3, depends on p0 and p2)
+//
+// DP processes p0, p1, p2, p3 in that order.  At p3 it only checks
+// instructions whose def-use predecessors already carry p0 and p2 labels.
+
+/// Capture-flow edge in the pattern DAG: line DefLine defines CaptureName
+/// which is used by line UseLine.
+struct PatternEdge {
+  unsigned DefLine;
+  unsigned UseLine;
+  std::string CaptureName;
+};
+
+/// Accumulated label from bottom-up DP.  Stored per (PatIdx, NodeID).
+struct DPLabel {
+  StringMap<Binding> Bindings;
+  /// Which instruction matched each pattern line in this label's subtree.
+  SmallDenseMap<unsigned, NodeID, 8> Trace;
+};
+
+/// Build the pattern dependency DAG and return edges + topological order.
+/// An edge exists from line A to line B when A defines a register capture
+/// that B uses.
+static void buildPatternDAG(
+    const BinaryContext &BC,
+    const std::vector<PatternLine> &Pattern,
+    SmallVectorImpl<PatternEdge> &Edges,
+    SmallVectorImpl<unsigned> &TopoOrder) {
+
+  // For each capture name, which line defines it (first definition wins).
+  StringMap<unsigned> CaptureDef;
+  for (unsigned I = 0; I < Pattern.size(); ++I) {
+    const PatternLine &PL = Pattern[I];
+    if (PL.IsAnnotationOnly)
+      continue;
+    SmallVector<std::string, 4> Defs, Uses;
+    classifyCapturePositions(BC, PL, nullptr, Defs, Uses);
+    for (const std::string &Name : Defs)
+      CaptureDef.try_emplace(Name, I);
+  }
+
+  // Build edges: for each line that uses a capture defined by another line.
+  // Adjacency for topo sort: InDeg[line] = number of predecessor lines.
+  SmallVector<unsigned, 8> InDeg(Pattern.size(), 0);
+  SmallVector<SmallVector<unsigned, 4>, 8> Successors(Pattern.size());
+
+  for (unsigned I = 0; I < Pattern.size(); ++I) {
+    const PatternLine &PL = Pattern[I];
+    if (PL.IsAnnotationOnly)
+      continue;
+    SmallVector<std::string, 4> Defs, Uses;
+    classifyCapturePositions(BC, PL, nullptr, Defs, Uses);
+
+    DenseSet<unsigned> SeenPreds;
+    for (const std::string &Name : Uses) {
+      auto It = CaptureDef.find(Name);
+      if (It == CaptureDef.end() || It->second == I)
+        continue;
+      unsigned DefLine = It->second;
+      Edges.push_back({DefLine, I, Name});
+      if (SeenPreds.insert(DefLine).second) {
+        Successors[DefLine].push_back(I);
+        InDeg[I]++;
+      }
+    }
+  }
+
+  // Kahn's algorithm for topological sort.
+  SmallVector<unsigned, 8> Queue;
+  for (unsigned I = 0; I < Pattern.size(); ++I) {
+    if (!Pattern[I].IsAnnotationOnly && InDeg[I] == 0)
+      Queue.push_back(I);
+  }
+  while (!Queue.empty()) {
+    unsigned Cur = Queue.pop_back_val();
+    TopoOrder.push_back(Cur);
+    for (unsigned Succ : Successors[Cur]) {
+      if (--InDeg[Succ] == 0)
+        Queue.push_back(Succ);
+    }
+  }
+}
+
+/// Run DP matching on a single function.  Returns all complete matches.
+static void dpMatchFunction(
+    const BinaryContext &BC,
+    const std::vector<PatternLine> &Pattern,
+    unsigned RootPatIdx,
+    const DefUseGraph &G,
+    const std::vector<BBInfo> &AllBBs,
+    const SmallVectorImpl<PatternEdge> &Edges,
+    const SmallVectorImpl<unsigned> &TopoOrder,
+    std::vector<MatchResult> &Results) {
+
+  unsigned NumPat = Pattern.size();
+
+  // Build per-line predecessor info: for each pattern line, which edges are
+  // incoming (i.e., which captures it uses from which predecessor line).
+  SmallVector<SmallVector<const PatternEdge *, 4>, 8> PredEdges(NumPat);
+  for (const PatternEdge &E : Edges)
+    PredEdges[E.UseLine].push_back(&E);
+
+  // Precompute uppercase mnemonic for each pattern line (for opcode filter).
+  SmallVector<std::string, 8> MnemUpper(NumPat);
+  for (unsigned I = 0; I < NumPat; ++I)
+    if (!Pattern[I].IsAnnotationOnly) {
+      StringRef M = Pattern[I].Mnemonic;
+      MnemUpper[I] = M.split('.').first.upper();
+    }
+
+  // Labels: for each pattern line, a map from NodeID to DPLabel.
+  std::vector<DenseMap<NodeID, DPLabel>> Labels(NumPat);
+
+  // Process pattern lines in topological order (leaves first).
+  for (unsigned PatIdx : TopoOrder) {
+    const PatternLine &PL = Pattern[PatIdx];
+    const auto &Preds = PredEdges[PatIdx];
+    bool IsLeaf = Preds.empty();
+
+    if (IsLeaf) {
+      // Leaf: scan all nodes with opcode filter.  If the filter yields
+      // no matches, retry without it (handles instruction aliases like
+      // sxtw → SBFMXri where printed mnemonic ≠ tablegen opcode name).
+      for (int Pass = 0; Pass < 2; ++Pass) {
+        bool UseFilter = (Pass == 0) && !MnemUpper[PatIdx].empty();
+        for (NodeID NID = 0; NID < G.Nodes.size(); ++NID) {
+          if (UseFilter) {
+            StringRef OpName =
+                BC.MII->getName(G.Nodes[NID].Inst->getOpcode());
+            if (!OpName.starts_with_insensitive(MnemUpper[PatIdx]))
+              continue;
+          }
+          G.Nodes[NID].ensureParsed(BC);
+          StringMap<Binding> Bindings;
+          if (!matchLine(BC, PL, G.Nodes[NID], Bindings))
+            continue;
+          DPLabel L;
+          L.Bindings = std::move(Bindings);
+          L.Trace[PatIdx] = NID;
+          Labels[PatIdx][NID] = std::move(L);
+        }
+        if (!Labels[PatIdx].empty())
+          break; // Found matches — don't retry.
+      }
+    } else {
+      // Non-leaf: propagate from labeled predecessors via def-use edges.
+      // Pick the predecessor with fewest labels as the "driving" edge,
+      // then verify the rest.
+      const PatternEdge *DrivingEdge = Preds[0];
+      unsigned BestSize = Labels[Preds[0]->DefLine].size();
+      for (unsigned I = 1; I < Preds.size(); ++I) {
+        unsigned Sz = Labels[Preds[I]->DefLine].size();
+        if (Sz < BestSize) {
+          BestSize = Sz;
+          DrivingEdge = Preds[I];
+        }
+      }
+
+      // For each labeled node of the driving predecessor, walk OutEdges to
+      // find candidate nodes for this pattern line.
+      DenseSet<NodeID> Visited;
+      for (auto &[PredNID, PredLabel] : Labels[DrivingEdge->DefLine]) {
+        // Find the register for the driving capture.
+        auto BIt = PredLabel.Bindings.find(DrivingEdge->CaptureName);
+        if (BIt == PredLabel.Bindings.end() || BIt->second.K != Binding::Reg)
+          continue;
+
+        auto EIt = G.OutEdges.find(PredNID);
+        if (EIt == G.OutEdges.end())
+          continue;
+
+        for (unsigned EIdx : EIt->second) {
+          const DefUseEdge &Edge = G.Edges[EIdx];
+          if (!regMatchesBinding(BC, Edge.Reg, BIt->second))
+            continue;
+          NodeID CandNID = Edge.Use;
+          if (!Visited.insert(CandNID).second)
+            continue;
+          // Already labeled for this pattern line? Skip.
+          if (Labels[PatIdx].count(CandNID))
+            continue;
+
+          G.Nodes[CandNID].ensureParsed(BC);
+          // Seed bindings from the driving predecessor so back-references
+          // (e.g., str %acc, _ where %acc was bound by an earlier line) work.
+          StringMap<Binding> Bindings = PredLabel.Bindings;
+          if (!matchLine(BC, PL, G.Nodes[CandNID], Bindings))
+            continue;
+
+          // Verify ALL predecessor edges are satisfied.
+          DPLabel NewLabel;
+          NewLabel.Bindings = std::move(Bindings);
+          NewLabel.Trace[PatIdx] = CandNID;
+
+          bool AllOK = true;
+          for (const PatternEdge *PE : Preds) {
+            // Find the register for this capture in the new bindings.
+            auto CB = NewLabel.Bindings.find(PE->CaptureName);
+            if (CB == NewLabel.Bindings.end() ||
+                CB->second.K != Binding::Reg) {
+              // Non-register capture (imm, label) — no edge check needed.
+              continue;
+            }
+
+            // Walk InEdges of CandNID to find a predecessor with a label
+            // for PE->DefLine.
+            bool FoundPred = false;
+            auto IE = G.InEdges.find(CandNID);
+            if (IE != G.InEdges.end()) {
+              for (unsigned EIdx2 : IE->second) {
+                const DefUseEdge &E2 = G.Edges[EIdx2];
+                if (!regMatchesBinding(BC, E2.Reg, CB->second))
+                  continue;
+                auto LIt = Labels[PE->DefLine].find(E2.Def);
+                if (LIt == Labels[PE->DefLine].end())
+                  continue;
+
+                // Check binding consistency: any shared capture names
+                // between the predecessor's label and ours must agree.
+                bool Consistent = true;
+                for (const auto &[Name, Val] : LIt->second.Bindings) {
+                  auto MyIt = NewLabel.Bindings.find(Name);
+                  if (MyIt == NewLabel.Bindings.end())
+                    continue;
+                  if (Val.K != MyIt->second.K) {
+                    Consistent = false;
+                    break;
+                  }
+                  if (Val.K == Binding::Reg &&
+                      Val.RegVal != MyIt->second.RegVal) {
+                    Consistent = false;
+                    break;
+                  }
+                  if (Val.K == Binding::Imm &&
+                      Val.ImmVal != MyIt->second.ImmVal) {
+                    Consistent = false;
+                    break;
+                  }
+                }
+                if (!Consistent)
+                  continue;
+
+                // Also check trace consistency: if the predecessor's trace
+                // overlaps ours, the same NodeID must be used.
+                bool TraceOK = true;
+                for (const auto &[PI, NI] : LIt->second.Trace) {
+                  auto TIt = NewLabel.Trace.find(PI);
+                  if (TIt != NewLabel.Trace.end() && TIt->second != NI) {
+                    TraceOK = false;
+                    break;
+                  }
+                }
+                if (!TraceOK)
+                  continue;
+
+                // Merge predecessor's bindings and trace.
+                for (const auto &[Name, Val] : LIt->second.Bindings)
+                  NewLabel.Bindings.try_emplace(Name, Val);
+                for (const auto &[PI, NI] : LIt->second.Trace)
+                  NewLabel.Trace.try_emplace(PI, NI);
+                FoundPred = true;
+                break; // Greedy: first valid predecessor.
+              }
+            }
+            if (!FoundPred) {
+              AllOK = false;
+              break;
+            }
+          }
+
+          if (AllOK)
+            Labels[PatIdx][CandNID] = std::move(NewLabel);
+        }
+      }
+    }
+  }
+
+  // ---- Harvest ----
+  // Find terminal pattern lines (no successors in the pattern DAG).
+  DenseSet<unsigned> HasSuccessor;
+  for (const PatternEdge &E : Edges)
+    HasSuccessor.insert(E.DefLine);
+
+  SmallVector<unsigned, 4> Terminals;
+  for (unsigned PI : TopoOrder)
+    if (!HasSuccessor.count(PI))
+      Terminals.push_back(PI);
+
+  // For patterns that are pure chains/trees, there's exactly one terminal
+  // whose labels contain the full trace.  For DAGs with multiple terminals
+  // (e.g., root has siblings that are both leaves), we need to join labels
+  // from different terminals that share compatible traces.
+  //
+  // Strategy: pick the terminal with the fewest labels as the "primary".
+  // For each primary label, find compatible labels in the other terminals
+  // by matching on shared trace entries (same predecessor NodeID).
+  unsigned PrimaryTerm = Terminals[0];
+  for (unsigned I = 1; I < Terminals.size(); ++I) {
+    if (Labels[Terminals[I]].size() < Labels[PrimaryTerm].size())
+      PrimaryTerm = Terminals[I];
+  }
+
+  DenseSet<const MCInst *> Matched;
+  for (auto &[PrimNID, PrimLabel] : Labels[PrimaryTerm]) {
+    // Start with the primary terminal's trace and bindings.
+    SmallDenseMap<unsigned, NodeID, 8> MergedTrace = PrimLabel.Trace;
+    StringMap<Binding> MergedBindings = PrimLabel.Bindings;
+
+    // Join with other terminals.
+    bool JoinOK = true;
+    for (unsigned T : Terminals) {
+      if (T == PrimaryTerm)
+        continue;
+
+      // Find a label in terminal T that is consistent with MergedTrace.
+      bool Found = false;
+      for (auto &[TNID, TLabel] : Labels[T]) {
+        // Check trace consistency.
+        bool Consistent = true;
+        for (const auto &[PI, NI] : TLabel.Trace) {
+          auto MT = MergedTrace.find(PI);
+          if (MT != MergedTrace.end() && MT->second != NI) {
+            Consistent = false;
+            break;
+          }
+        }
+        if (!Consistent)
+          continue;
+
+        // Check binding consistency.
+        for (const auto &[Name, Val] : TLabel.Bindings) {
+          auto MB = MergedBindings.find(Name);
+          if (MB == MergedBindings.end())
+            continue;
+          if (Val.K != MB->second.K ||
+              (Val.K == Binding::Reg && Val.RegVal != MB->second.RegVal) ||
+              (Val.K == Binding::Imm && Val.ImmVal != MB->second.ImmVal)) {
+            Consistent = false;
+            break;
+          }
+        }
+        if (!Consistent)
+          continue;
+
+        // Merge.
+        for (const auto &[PI, NI] : TLabel.Trace)
+          MergedTrace.try_emplace(PI, NI);
+        for (const auto &[Name, Val] : TLabel.Bindings)
+          MergedBindings.try_emplace(Name, Val);
+        Found = true;
+        break;
+      }
+      if (!Found) {
+        JoinOK = false;
+        break;
+      }
+    }
+    if (!JoinOK)
+      continue;
+
+    // Check that no instruction in this match was already used.
+    bool Conflict = false;
+    for (const auto &[PI, NI] : MergedTrace) {
+      if (Matched.count(G.Nodes[NI].Inst)) {
+        Conflict = true;
+        break;
+      }
+    }
+    if (Conflict)
+      continue;
+
+    // Build MatchedNodeIDs in pattern order.
+    SmallVector<NodeID, 8> MatchedNodeIDs;
+    bool Complete = true;
+    for (unsigned PI = 0; PI < NumPat; ++PI) {
+      if (Pattern[PI].IsAnnotationOnly)
+        continue;
+      auto TIt = MergedTrace.find(PI);
+      if (TIt == MergedTrace.end()) {
+        Complete = false;
+        break;
+      }
+      MatchedNodeIDs.push_back(TIt->second);
+    }
+    if (!Complete)
+      continue;
+
+    // Validate post-match constraints (@one_use, @same_bb, etc.).
+    if (!validateConstraints(BC, Pattern, G, MatchedNodeIDs, MergedBindings))
+      continue;
+
+    // Mark all matched instructions.
+    for (const auto &[PI, NI] : MergedTrace)
+      Matched.insert(G.Nodes[NI].Inst);
+
+    // Build result.
+    MatchResult Result;
+    Result.Bindings = std::move(MergedBindings);
+    Result.MatchedNodeIDs = std::move(MatchedNodeIDs);
+    for (NodeID NID : Result.MatchedNodeIDs) {
+      const InstrNode &Node = G.Nodes[NID];
+      Result.MatchedInstrs.push_back({&AllBBs[Node.BBIndex], Node.InstIndex});
+    }
+    Results.push_back(std::move(Result));
+  }
+}
+
 // Graph-based pattern matching using root as anchor.
 static bool tryGraphMatch(const BinaryContext &BC,
                            const std::vector<PatternLine> &Pattern,
@@ -2266,7 +2771,11 @@ collectMnemPrefixes(const std::vector<PatternLine> &Pattern) {
   for (const PatternLine &PL : Pattern) {
     if (PL.IsAnnotationOnly || PL.Mnemonic.empty())
       continue;
-    Prefixes.push_back(StringRef(PL.Mnemonic).upper());
+    // Strip NEON qualifier (e.g., ".4s", ".16b") — tablegen opcode names
+    // like "ADDv4i32" don't contain the dot-qualifier.
+    StringRef M = PL.Mnemonic;
+    M = M.split('.').first;
+    Prefixes.push_back(M.upper());
   }
   // Deduplicate.
   llvm::sort(Prefixes);
@@ -2338,7 +2847,7 @@ static void runLinearMatcher(const BinaryContext &BC,
 
       // Pre-compute first pattern line mnemonic (uppercased) for fast opcode filtering.
       const PatternLine &FirstPL = Pattern[0];
-      std::string FirstMnemUpper = StringRef(FirstPL.Mnemonic).upper();
+      std::string FirstMnemUpper = StringRef(FirstPL.Mnemonic).split('.').first.upper();
 
       for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
         for (unsigned InstIdx = 0; InstIdx < AllBBs[BBIdx].Nodes.size();
@@ -2406,12 +2915,16 @@ static void runGraphMatcher(const BinaryContext &BC,
 
   // Collect all pattern mnemonic prefixes for function-level pre-filter.
   SmallVector<std::string, 4> Prefixes = collectMnemPrefixes(Pattern);
-  std::string RootMnemUpper = StringRef(Pattern[RootPatIdx].Mnemonic).upper();
+
+  // Build pattern DAG once (shared across all threads — read-only).
+  SmallVector<PatternEdge, 8> PatEdges;
+  SmallVector<unsigned, 8> TopoOrder;
+  buildPatternDAG(BC, Pattern, PatEdges, TopoOrder);
 
   DefaultThreadPool Pool(hardware_concurrency(opts::ThreadCount));
   for (unsigned FIdx = 0; FIdx < Functions.size(); ++FIdx) {
     Pool.async([&BC, &Pattern, RootPatIdx, &Functions, &AllResults, &Completed,
-                Total, ShowProgress, FIdx, &Prefixes, &RootMnemUpper] {
+                Total, ShowProgress, FIdx, &Prefixes, &PatEdges, &TopoOrder] {
       const BinaryFunction &BF = *Functions[FIdx];
 
       // Skip functions that don't contain all required opcodes.
@@ -2426,28 +2939,15 @@ static void runGraphMatcher(const BinaryContext &BC,
       }
 
       std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF, /*ComputeLiveness=*/false);
-      DefUseGraph G = buildDefUseGraph(AllBBs);
-      DenseSet<const MCInst *> LocalMatched;
+      DefUseGraph G = buildDefUseGraph(AllBBs, *BC.MRI);
 
-      for (NodeID NID = 0; NID < G.Nodes.size(); ++NID) {
-        if (LocalMatched.count(G.Nodes[NID].Inst))
-          continue;
-
-        // Fast opcode-level pre-filter: tablegen name starts with uppercase mnem.
-        const InstrNode &CandNode = G.Nodes[NID];
-        {
-          StringRef OpName = BC.MII->getName(CandNode.Inst->getOpcode());
-          if (!OpName.starts_with_insensitive(RootMnemUpper))
-            continue;
-        }
-
-        MatchResult Result;
-        if (tryGraphMatch(BC, Pattern, RootPatIdx, G, AllBBs, NID, Result)) {
-          for (const auto &[BI, Idx] : Result.MatchedInstrs)
-            LocalMatched.insert(BI->Nodes[Idx].Inst);
-          Result.FunctionName = BF.getPrintName();
-          AllResults[FIdx].Matches.push_back(std::move(Result));
-        }
+      // Run DP matcher for this function.
+      std::vector<MatchResult> FuncMatches;
+      dpMatchFunction(BC, Pattern, RootPatIdx, G, AllBBs, PatEdges, TopoOrder,
+                      FuncMatches);
+      for (auto &R : FuncMatches) {
+        R.FunctionName = BF.getPrintName();
+        AllResults[FIdx].Matches.push_back(std::move(R));
       }
 
       AllResults[FIdx].AllBBs = std::move(AllBBs);
