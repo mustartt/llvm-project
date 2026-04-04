@@ -1988,125 +1988,6 @@ static void classifyCapturePositions(
   }
 }
 
-// Find candidate NodeIDs for a pattern line by walking def-use edges.
-static SmallVector<NodeID, 8> findGraphCandidates(
-    const BinaryContext &BC, const DefUseGraph &G, const PatternLine &PL,
-    const StringMap<Binding> &Bindings,
-    const StringMap<SmallVector<NodeID, 2>> &CaptureProducers,
-    const StringMap<SmallVector<NodeID, 2>> &CaptureConsumers,
-    const DenseSet<NodeID> &AlreadyMatchedNodes) {
-  SmallVector<NodeID, 8> Candidates;
-  DenseSet<NodeID> Seen;
-
-  SmallVector<std::string, 4> DefCaptures, UseCaptures;
-  classifyCapturePositions(BC, PL, nullptr, DefCaptures, UseCaptures);
-
-  LLVM_DEBUG({
-    dbgs() << "    findGraphCandidates: DefCaptures:";
-    for (const auto &N : DefCaptures) dbgs() << " '" << N << "'";
-    dbgs() << " UseCaptures:";
-    for (const auto &N : UseCaptures) dbgs() << " '" << N << "'";
-    dbgs() << "\n";
-  });
-
-  // For each bound capture that appears in a DEF position of this pattern line,
-  // this instruction produces the capture → walk backward from consumers.
-  for (const std::string &Name : DefCaptures) {
-    auto BIt = Bindings.find(Name);
-    if (BIt == Bindings.end())
-      continue;
-    const Binding &B = BIt->second;
-    if (B.K != Binding::Reg)
-      continue;
-
-    // Walk backward: find nodes that are Def endpoints of InEdges of consumers.
-    auto CIt = CaptureConsumers.find(Name);
-    if (CIt == CaptureConsumers.end())
-      continue;
-    for (NodeID ConsumerNID : CIt->second) {
-      auto EIt = G.InEdges.find(ConsumerNID);
-      if (EIt == G.InEdges.end())
-        continue;
-      for (unsigned EIdx : EIt->second) {
-        const DefUseEdge &E = G.Edges[EIdx];
-        if (regMatchesBinding(BC, E.Reg, B) &&
-            !AlreadyMatchedNodes.count(E.Def) && Seen.insert(E.Def).second)
-          Candidates.push_back(E.Def);
-      }
-    }
-  }
-
-  // For each bound capture that appears in a USE position of this pattern line,
-  // this instruction consumes the capture → walk forward from producers.
-  for (const std::string &Name : UseCaptures) {
-    auto BIt = Bindings.find(Name);
-    if (BIt == Bindings.end())
-      continue;
-    const Binding &B = BIt->second;
-    if (B.K != Binding::Reg)
-      continue;
-
-    auto PIt = CaptureProducers.find(Name);
-    if (PIt == CaptureProducers.end())
-      continue;
-    for (NodeID ProducerNID : PIt->second) {
-      auto EIt = G.OutEdges.find(ProducerNID);
-      if (EIt == G.OutEdges.end())
-        continue;
-      for (unsigned EIdx : EIt->second) {
-        const DefUseEdge &E = G.Edges[EIdx];
-        if (regMatchesBinding(BC, E.Reg, B) &&
-            !AlreadyMatchedNodes.count(E.Use) && Seen.insert(E.Use).second)
-          Candidates.push_back(E.Use);
-      }
-    }
-  }
-
-  // Fallback: if no candidates found via edges (e.g., no bound captures
-  // connect this line to already-matched nodes), try all unmatched nodes.
-  if (Candidates.empty()) {
-    for (NodeID NID = 0; NID < G.Nodes.size(); ++NID) {
-      if (!AlreadyMatchedNodes.count(NID))
-        Candidates.push_back(NID);
-    }
-  }
-
-  // Filter candidates by opcode name for early rejection (avoids printInst).
-  if (!PL.Mnemonic.empty()) {
-    std::string MnemUpper = StringRef(PL.Mnemonic).upper();
-    SmallVector<NodeID, 8> Filtered;
-    for (NodeID NID : Candidates) {
-      StringRef OpName = BC.MII->getName(G.Nodes[NID].Inst->getOpcode());
-      if (OpName.starts_with_insensitive(MnemUpper))
-        Filtered.push_back(NID);
-    }
-    return Filtered;
-  }
-
-  return Candidates;
-}
-
-// Update CaptureProducers and CaptureConsumers after matching a pattern line.
-static void updateCaptureTracking(
-    const BinaryContext &BC, const PatternLine &PL,
-    NodeID MatchedNID, const InstrNode *MatchedNode,
-    const StringMap<Binding> &Bindings,
-    StringMap<SmallVector<NodeID, 2>> &CaptureProducers,
-    StringMap<SmallVector<NodeID, 2>> &CaptureConsumers) {
-  SmallVector<std::string, 4> DefCaptures, UseCaptures;
-  classifyCapturePositions(BC, PL, MatchedNode, DefCaptures, UseCaptures);
-
-  for (const std::string &Name : DefCaptures) {
-    auto BIt = Bindings.find(Name);
-    if (BIt != Bindings.end() && BIt->second.K == Binding::Reg)
-      CaptureProducers[BIt->first()].push_back(MatchedNID);
-  }
-  for (const std::string &Name : UseCaptures) {
-    auto BIt = Bindings.find(Name);
-    if (BIt != Bindings.end() && BIt->second.K == Binding::Reg)
-      CaptureConsumers[BIt->first()].push_back(MatchedNID);
-  }
-}
 
 // Validate post-match constraints (@one_use, @has_use, @same_bb).
 static bool validateConstraints(
@@ -2318,7 +2199,6 @@ static void buildPatternDAG(
 static void dpMatchFunction(
     const BinaryContext &BC,
     const std::vector<PatternLine> &Pattern,
-    unsigned RootPatIdx,
     const DefUseGraph &G,
     const std::vector<BBInfo> &AllBBs,
     const SmallVectorImpl<PatternEdge> &Edges,
@@ -2638,101 +2518,6 @@ static void dpMatchFunction(
   }
 }
 
-// Graph-based pattern matching using root as anchor.
-static bool tryGraphMatch(const BinaryContext &BC,
-                           const std::vector<PatternLine> &Pattern,
-                           unsigned RootPatIdx,
-                           const DefUseGraph &G,
-                           const std::vector<BBInfo> &AllBBs,
-                           NodeID RootNID,
-                           MatchResult &Result) {
-  StringMap<Binding> Bindings;
-
-  // Try matching the root pattern line against the root node.
-  if (!matchLine(BC, Pattern[RootPatIdx], G.Nodes[RootNID], Bindings))
-    return false;
-
-  // Map from pattern index → matched NodeID (pattern-order aligned).
-  DenseMap<unsigned, NodeID> PatIdxToNodeID;
-  PatIdxToNodeID[RootPatIdx] = RootNID;
-  DenseSet<NodeID> AlreadyMatchedNodes;
-  AlreadyMatchedNodes.insert(RootNID);
-
-  // Initialize capture tracking from root.
-  StringMap<SmallVector<NodeID, 2>> CaptureProducers;
-  StringMap<SmallVector<NodeID, 2>> CaptureConsumers;
-  updateCaptureTracking(BC, Pattern[RootPatIdx], RootNID,
-                        &G.Nodes[RootNID], Bindings,
-                        CaptureProducers, CaptureConsumers);
-
-  // Match remaining pattern lines in order.
-  for (unsigned PatIdx = 0; PatIdx < Pattern.size(); ++PatIdx) {
-    if (PatIdx == RootPatIdx)
-      continue;
-
-    const PatternLine &PL = Pattern[PatIdx];
-
-    // Annotation-only lines don't need candidate search.
-    if (PL.IsAnnotationOnly)
-      continue;
-
-    // Find candidates via def-use graph.
-    SmallVector<NodeID, 8> Candidates = findGraphCandidates(
-        BC, G, PL, Bindings, CaptureProducers, CaptureConsumers,
-        AlreadyMatchedNodes);
-
-    LLVM_DEBUG({
-      dbgs() << "  Pattern line " << PatIdx << " ('" << PL.Mnemonic
-             << "'): " << Candidates.size() << " candidates\n";
-      for (NodeID C : Candidates) {
-        G.Nodes[C].ensureParsed(BC);
-        dbgs() << "    candidate NID=" << C << " mnem='"
-               << G.Nodes[C].Mnemonic << "'\n";
-      }
-    });
-
-    bool Matched = false;
-    for (NodeID CandNID : Candidates) {
-      StringMap<Binding> TryBindings = Bindings;
-      if (matchLine(BC, PL, G.Nodes[CandNID], TryBindings)) {
-        Bindings = std::move(TryBindings);
-        PatIdxToNodeID[PatIdx] = CandNID;
-        AlreadyMatchedNodes.insert(CandNID);
-        updateCaptureTracking(BC, PL, CandNID, &G.Nodes[CandNID],
-                              Bindings, CaptureProducers, CaptureConsumers);
-        Matched = true;
-        break;
-      }
-    }
-
-    if (!Matched)
-      return false;
-  }
-
-  // Build MatchedNodeIDs in pattern order (non-annotation lines only).
-  SmallVector<NodeID, 8> MatchedNodeIDs;
-  for (unsigned PatIdx = 0; PatIdx < Pattern.size(); ++PatIdx) {
-    auto It = PatIdxToNodeID.find(PatIdx);
-    if (It != PatIdxToNodeID.end())
-      MatchedNodeIDs.push_back(It->second);
-  }
-
-  // Validate post-match constraints.
-  if (!validateConstraints(BC, Pattern, G, MatchedNodeIDs, Bindings))
-    return false;
-
-  // Build MatchResult from matched NodeIDs.
-  Result.Bindings = std::move(Bindings);
-  Result.MatchedNodeIDs = std::move(MatchedNodeIDs);
-
-  // Convert NodeIDs to (BBInfo*, InstIdx) pairs for display.
-  for (NodeID NID : Result.MatchedNodeIDs) {
-    const InstrNode &Node = G.Nodes[NID];
-    Result.MatchedInstrs.push_back({&AllBBs[Node.BBIndex], Node.InstIndex});
-  }
-
-  return true;
-}
 
 // Print a match result (shared between linear and graph matchers).
 static void printMatchResult(const BinaryContext &BC, const MatchResult &Result,
@@ -2901,7 +2686,6 @@ static void runLinearMatcher(const BinaryContext &BC,
 
 static void runGraphMatcher(const BinaryContext &BC,
                             const std::vector<PatternLine> &Pattern,
-                            unsigned RootPatIdx,
                             unsigned &MatchCount,
                             std::vector<std::pair<std::string, unsigned>> &FuncHits) {
   SmallVector<const BinaryFunction *, 0> Functions;
@@ -2923,7 +2707,7 @@ static void runGraphMatcher(const BinaryContext &BC,
 
   DefaultThreadPool Pool(hardware_concurrency(opts::ThreadCount));
   for (unsigned FIdx = 0; FIdx < Functions.size(); ++FIdx) {
-    Pool.async([&BC, &Pattern, RootPatIdx, &Functions, &AllResults, &Completed,
+    Pool.async([&BC, &Pattern, &Functions, &AllResults, &Completed,
                 Total, ShowProgress, FIdx, &Prefixes, &PatEdges, &TopoOrder] {
       const BinaryFunction &BF = *Functions[FIdx];
 
@@ -2943,7 +2727,7 @@ static void runGraphMatcher(const BinaryContext &BC,
 
       // Run DP matcher for this function.
       std::vector<MatchResult> FuncMatches;
-      dpMatchFunction(BC, Pattern, RootPatIdx, G, AllBBs, PatEdges, TopoOrder,
+      dpMatchFunction(BC, Pattern, G, AllBBs, PatEdges, TopoOrder,
                       FuncMatches);
       for (auto &R : FuncMatches) {
         R.FunctionName = BF.getPrintName();
@@ -2981,21 +2765,11 @@ static void runMatcher(const BinaryContext &BC,
   if (Pattern.empty())
     return;
 
-  // Check if any pattern line is an explicit root.
-  int RootPatIdx = -1;
-  for (unsigned I = 0; I < Pattern.size(); ++I) {
-    if (Pattern[I].IsRoot) {
-      RootPatIdx = I;
-      break;
-    }
-  }
-
-  // Auto-detect: if no explicit root but shared captures exist, pick the best
-  // root and use the graph matcher. A "graph pattern" is one where at least one
-  // capture name appears in more than one non-annotation line.
+  // Detect graph patterns: at least one capture name appears in more than
+  // one non-annotation line (i.e., there are def-use dependencies between
+  // pattern lines).
   bool IsGraphPattern = false;
-  if (RootPatIdx < 0) {
-    // Collect capture names per line.
+  {
     StringMap<SmallVector<unsigned, 2>> CaptureLines;
     for (unsigned I = 0; I < Pattern.size(); ++I) {
       if (Pattern[I].IsAnnotationOnly)
@@ -3016,7 +2790,6 @@ static void runMatcher(const BinaryContext &BC,
     }
 
     for (const auto &[Name, Lines] : CaptureLines) {
-      // A shared capture: appears in >1 distinct lines.
       SmallVector<unsigned, 2> Unique(Lines.begin(), Lines.end());
       llvm::sort(Unique);
       Unique.erase(llvm::unique(Unique), Unique.end());
@@ -3025,59 +2798,18 @@ static void runMatcher(const BinaryContext &BC,
         break;
       }
     }
-
-    if (IsGraphPattern) {
-      // Score each line: higher = better root candidate.
-      //   +4  exact mnemonic (not regex, not empty)
-      //   +2  per typed capture (wreg/xreg/reg/imm)
-      //   +1  per shared capture (appears in another line)
-      //   -10 annotation-only line
-      //   -5  wildcard-only mnemonic ({{.*}})
-      int BestScore = -100;
-      for (unsigned I = 0; I < Pattern.size(); ++I) {
-        const PatternLine &PL = Pattern[I];
-        if (PL.IsAnnotationOnly)
-          continue;
-        int Score = 0;
-        if (!PL.Mnemonic.empty() && PL.MnemRegex.empty())
-          Score += 4;
-        else if (PL.Mnemonic.empty() && !PL.MnemRegex.empty())
-          Score -= 5;
-        for (const PatternOperand &PO : PL.Operands) {
-          if (PO.K == PatternOperand::Capture && !PO.Name.empty()) {
-            if (!PO.Type.empty() && PO.Type != "nzcv")
-              Score += 2;
-            auto It = CaptureLines.find(PO.Name);
-            if (It != CaptureLines.end()) {
-              SmallVector<unsigned, 2> U(It->second.begin(), It->second.end());
-              llvm::sort(U);
-              U.erase(llvm::unique(U), U.end());
-              if (U.size() > 1)
-                Score += 1;
-            }
-          } else if (PO.K == PatternOperand::MemOperand) {
-            for (const PatternOperand &Sub : PO.SubOperands)
-              if (Sub.K == PatternOperand::Capture && !Sub.Type.empty())
-                Score += 2;
-          }
-        }
-        if (Score > BestScore) {
-          BestScore = Score;
-          RootPatIdx = I;
-        }
-      }
-    }
   }
+
+  // Also treat any pattern with an explicit 'root' as a graph pattern.
+  for (const PatternLine &PL : Pattern)
+    if (PL.IsRoot)
+      IsGraphPattern = true;
 
   unsigned MatchCount = 0;
   std::vector<std::pair<std::string, unsigned>> FuncHits;
-  if (RootPatIdx >= 0) {
-    bool Explicit = Pattern[RootPatIdx].IsRoot;
-    outs() << "Using graph-based matcher ("
-           << (Explicit ? "explicit" : "auto-detected") << " root at line "
-           << RootPatIdx << ": " << Pattern[RootPatIdx].Mnemonic << ")\n";
-    runGraphMatcher(BC, Pattern, static_cast<unsigned>(RootPatIdx), MatchCount,
-                    FuncHits);
+  if (IsGraphPattern) {
+    outs() << "Using graph-based DP matcher\n";
+    runGraphMatcher(BC, Pattern, MatchCount, FuncHits);
   } else {
     runLinearMatcher(BC, Pattern, MatchCount, FuncHits);
   }
