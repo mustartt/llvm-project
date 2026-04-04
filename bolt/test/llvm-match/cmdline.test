@@ -1,0 +1,52 @@
+## Test command-line error handling and edge cases.
+
+# REQUIRES: system-linux
+
+# RUN: split-file %s %t
+# RUN: llvm-mc -filetype=obj -triple aarch64-unknown-unknown %t/test.s -o %t.o
+# RUN: %clang %cflags %t.o -o %t.exe -Wl,-q -static
+
+## Missing input file.
+# RUN: not llvm-match --pattern %t/ret.pat nonexistent 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=NOFILE
+# NOFILE: llvm-match{{(\.exe)?}}: 'nonexistent'
+
+## Missing pattern file.
+# RUN: not llvm-match --pattern nonexistent.pat %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=NOPAT
+# NOPAT: llvm-match{{(\.exe)?}}: 'nonexistent.pat'
+
+## Empty pattern file produces error.
+# RUN: touch %t/empty.pat
+# RUN: not llvm-match --pattern %t/empty.pat %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=EMPTY
+# EMPTY: no pattern lines found
+
+## Missing suite file.
+# RUN: not llvm-match --suite nonexistent.yaml %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=NOSUITE
+# NOSUITE: llvm-match{{(\.exe)?}}: 'nonexistent.yaml'
+
+## Empty suite file produces error.
+# RUN: touch %t/empty.yaml
+# RUN: not llvm-match --suite %t/empty.yaml %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=EMPTYSUITE
+# EMPTYSUITE: no patterns found in suite
+
+## dump-functions works without a pattern.
+# RUN: llvm-match --dump-functions %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=DUMP
+# DUMP: Function: _start
+
+#--- test.s
+  .text
+  .globl _start
+  .type _start, %function
+_start:
+  .cfi_startproc
+  ret
+  .cfi_endproc
+.size _start, .-_start
+
+#--- ret.pat
+ret

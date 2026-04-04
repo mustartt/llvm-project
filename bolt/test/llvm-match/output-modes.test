@@ -1,0 +1,59 @@
+## Test --summary and --detailed output modes.
+
+# REQUIRES: system-linux
+
+# RUN: split-file %s %t
+# RUN: llvm-mc -filetype=obj -triple aarch64-unknown-unknown %t/test.s -o %t.o
+# RUN: %clang %cflags %t.o -o %t.exe -Wl,-q -static
+
+## Default mode: only total count, no per-match or per-function output.
+# RUN: llvm-match --pattern %t/adrp_add.pat %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=COUNT
+# COUNT-NOT: === Match #
+# COUNT-NOT: adrp_add_func
+# COUNT: Total matches: 3
+
+## Summary mode: per-function hit counts, descending order.
+# RUN: llvm-match --pattern %t/adrp_add.pat --summary %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=SUMMARY
+# SUMMARY-NOT: === Match #
+# SUMMARY: 2{{.*}}adrp_add_func
+# SUMMARY: 1{{.*}}_start
+# SUMMARY: Total matches: 3
+
+## Detailed mode: every individual match printed.
+# RUN: llvm-match --pattern %t/adrp_add.pat --detailed %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=DETAILED
+# DETAILED: === Match #1 in adrp_add_func ===
+# DETAILED: === Match #2 in adrp_add_func ===
+# DETAILED: === Match #3 in _start ===
+# DETAILED: Total matches: 3
+
+#--- test.s
+  .text
+  .globl adrp_add_func
+  .type adrp_add_func, %function
+adrp_add_func:
+  .cfi_startproc
+  adrp x0, adrp_add_func
+  add x0, x0, :lo12:adrp_add_func
+  adrp x1, _start
+  add x1, x1, :lo12:_start
+  ret
+  .cfi_endproc
+.size adrp_add_func, .-adrp_add_func
+
+  .globl _start
+  .type _start, %function
+_start:
+  .cfi_startproc
+  adrp x0, adrp_add_func
+  add x0, x0, :lo12:adrp_add_func
+  bl adrp_add_func
+  ret
+  .cfi_endproc
+.size _start, .-_start
+
+#--- adrp_add.pat
+adrp %page:xreg, _
+root add %addr:xreg, %page, _

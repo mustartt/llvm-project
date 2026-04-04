@@ -40,6 +40,7 @@ list(APPEND BOLT_TEST_DEPS
   llvm-bolt-binary-analysis
   llvm-bolt-heatmap
   llvm-bat-dump
+  llvm-match
   llvm-dwarfdump
   llvm-dwp
   llvm-mc

@@ -1,0 +1,59 @@
+## Test that -j (thread count) produces deterministic, identical results.
+
+# REQUIRES: system-linux
+
+# RUN: split-file %s %t
+# RUN: llvm-mc -filetype=obj -triple aarch64-unknown-unknown %t/test.s -o %t.o
+# RUN: %clang %cflags %t.o -o %t.exe -Wl,-q -static
+
+## Single-threaded and multi-threaded should produce identical match counts.
+# RUN: llvm-match --pattern %t/adrp_add.pat -j 1 %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=THREAD
+# RUN: llvm-match --pattern %t/adrp_add.pat -j 2 %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=THREAD
+# RUN: llvm-match --pattern %t/adrp_add.pat -j 0 %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=THREAD
+# THREAD: Total matches: 2
+
+## Detailed output should also be identical regardless of thread count.
+# RUN: llvm-match --pattern %t/adrp_add.pat --detailed -j 1 %t.exe 2>&1 \
+# RUN:   | grep '=== Match' > %t/out1.txt
+# RUN: llvm-match --pattern %t/adrp_add.pat --detailed -j 2 %t.exe 2>&1 \
+# RUN:   | grep '=== Match' > %t/out2.txt
+# RUN: diff %t/out1.txt %t/out2.txt
+
+#--- test.s
+  .text
+  .globl func_a
+  .type func_a, %function
+func_a:
+  .cfi_startproc
+  adrp x0, func_a
+  add x0, x0, :lo12:func_a
+  ret
+  .cfi_endproc
+.size func_a, .-func_a
+
+  .globl func_b
+  .type func_b, %function
+func_b:
+  .cfi_startproc
+  adrp x0, func_a
+  add x0, x0, :lo12:func_a
+  ret
+  .cfi_endproc
+.size func_b, .-func_b
+
+  .globl _start
+  .type _start, %function
+_start:
+  .cfi_startproc
+  bl func_a
+  bl func_b
+  ret
+  .cfi_endproc
+.size _start, .-_start
+
+#--- adrp_add.pat
+adrp %page:xreg, _
+root add %addr:xreg, %page, _

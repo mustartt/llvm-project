@@ -1,0 +1,77 @@
+## Test pattern features: wildcards, annotations, and bindings.
+
+# REQUIRES: system-linux
+
+# RUN: split-file %s %t
+# RUN: llvm-mc -filetype=obj -triple aarch64-unknown-unknown %t/test.s -o %t.o
+# RUN: %clang %cflags %t.o -o %t.exe -Wl,-q -static
+
+## Wildcard _ matches any operand.
+# RUN: llvm-match --pattern %t/wildcard.pat %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=WILD
+# WILD: Total matches: 2
+
+## Typed captures constrain register class.
+# RUN: llvm-match --pattern %t/typed.pat --detailed %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=TYPED
+# TYPED: === Match #1
+# TYPED: Bindings:
+# TYPED: %dst = w{{[0-9]+}}
+
+## @same_bb annotation restricts matches to a single basic block.
+# RUN: llvm-match --pattern %t/samebb.pat %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=SAMEBB
+# SAMEBB: Total matches: 1
+
+## dump-pattern shows parsed pattern structure.
+# RUN: llvm-match --pattern %t/typed.pat --dump-pattern %t.exe 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=DUMPAT
+# DUMPAT: Pattern ({{[0-9]+}} lines)
+
+#--- test.s
+  .text
+
+  .globl paired_func
+  .type paired_func, %function
+paired_func:
+  .cfi_startproc
+  ldrb w8, [x0]
+  and w8, w8, #0xff
+  mov w0, w8
+  ret
+  .cfi_endproc
+.size paired_func, .-paired_func
+
+  .globl split_func
+  .type split_func, %function
+split_func:
+  .cfi_startproc
+  ldrb w8, [x0]
+  cbz w8, .Lskip
+  and w8, w8, #0xff
+.Lskip:
+  mov w0, w8
+  ret
+  .cfi_endproc
+.size split_func, .-split_func
+
+  .globl _start
+  .type _start, %function
+_start:
+  .cfi_startproc
+  bl paired_func
+  bl split_func
+  ret
+  .cfi_endproc
+.size _start, .-_start
+
+#--- wildcard.pat
+ldrb _, _
+
+#--- typed.pat
+ldrb %dst:wreg, _
+
+#--- samebb.pat
+ldrb %v:wreg, _
+root and _, %v, #0xff
+@same_bb

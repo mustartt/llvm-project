@@ -19,6 +19,7 @@
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
@@ -40,6 +41,8 @@
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/YAMLParser.h"
+#include "llvm/Support/Timer.h"
 #include <atomic>
 #include <optional>
 
@@ -67,6 +70,10 @@ static cl::opt<std::string>
     PatternFilename("pattern", cl::desc("pattern file for matching"),
                     cl::Optional, cl::cat(MatchCategory));
 
+static cl::opt<std::string>
+    SuiteFilename("suite", cl::desc("YAML suite file with multiple patterns"),
+                  cl::Optional, cl::cat(MatchCategory));
+
 static cl::opt<bool>
     DumpLiveness("dump-liveness", cl::desc("dump live-in/live-out per BB"),
                  cl::Optional, cl::cat(MatchCategory));
@@ -89,9 +96,26 @@ static cl::opt<std::string>
                    cl::value_desc("filename"),
                    cl::Optional, cl::cat(MatchCategory));
 
+enum OutputMode { OM_Count, OM_Summary, OM_Detailed };
+static cl::opt<OutputMode> OutputLevel(
+    cl::desc("output verbosity (default: count only)"),
+    cl::values(clEnumValN(OM_Summary, "summary",
+                          "show per-function hit counts sorted by frequency"),
+               clEnumValN(OM_Detailed, "detailed",
+                          "show every individual match (verbose)")),
+    cl::init(OM_Count), cl::cat(MatchCategory));
+
+static cl::opt<bool>
+    TimeOpt("time", cl::desc("print timing breakdown"),
+            cl::Optional, cl::cat(MatchCategory));
+
 } // namespace opts
 
 static StringRef ToolName = "llvm-match";
+
+static TimerGroup TG("llvm-match", "llvm-match timing");
+static Timer TBinary("binary", "Binary loading", TG);
+static Timer TMatch("match", "Pattern matching", TG);
 
 static void report_error(StringRef Message, std::error_code EC) {
   assert(EC);
@@ -115,17 +139,45 @@ static std::string GetExecutablePath(const char *Argv0) {
   return std::string(ExecutablePath.str());
 }
 
+// Forward declarations.
+static SmallVector<StringRef, 4> splitOperands(StringRef S);
+
 // ===----------------------------------------------------------------------===//
 // Data structures
 // ===----------------------------------------------------------------------===//
 
+/// Parsed assembly operand — either a leaf token or a bracketed group.
+struct AsmOperand {
+  std::string Text;                        // Leaf text (e.g., "x0", "#8")
+  std::vector<AsmOperand> Children;        // Non-empty for memory operands
+  bool PreIndex = false;                   // [...]! form
+
+  bool isMem() const { return !Children.empty(); }
+};
+
+// Forward declarations needed by InstrNode::ensureParsed.
+static AsmOperand parseAsmOperand(StringRef Token);
+static void parseAsmText(const BinaryContext &BC, const MCInst &Inst,
+                         std::string &Mnemonic,
+                         SmallVectorImpl<AsmOperand> &Operands);
+
 struct InstrNode {
   const MCInst *Inst;
-  std::string Mnemonic;     // Assembly mnemonic (e.g., "cmp")
+  mutable std::string Mnemonic;     // Assembly mnemonic, lazily populated
+  mutable SmallVector<AsmOperand, 4> Operands; // Pre-parsed operand tree, lazy
+  mutable bool Parsed = false;      // Whether Mnemonic/Operands are populated
   unsigned BBIndex;
   unsigned InstIndex;       // Index within BB
   SmallVector<MCPhysReg, 4> Defs; // Registers defined (explicit + implicit)
   SmallVector<MCPhysReg, 4> Uses; // Registers used (explicit + implicit)
+
+  /// Ensure Mnemonic and Operands are populated (lazy printInst).
+  void ensureParsed(const BinaryContext &BC) const {
+    if (Parsed)
+      return;
+    parseAsmText(BC, *Inst, Mnemonic, Operands);
+    Parsed = true;
+  }
 };
 
 struct BBInfo {
@@ -315,8 +367,69 @@ static void computeInstrDefsUses(const BinaryContext &BC, const MCInst &Inst,
     Uses.push_back(Reg);
 }
 
+// Parse a single operand token into an AsmOperand, handling brackets recursively.
+static AsmOperand parseAsmOperand(StringRef Token) {
+  AsmOperand Op;
+  Token = Token.trim();
+
+  // Check for bracketed memory operand: [base, offset] or [base, offset]!
+  if (Token.starts_with("[")) {
+    StringRef Inner = Token;
+    if (Inner.ends_with("!")) {
+      Op.PreIndex = true;
+      Inner = Inner.drop_back(1);
+    }
+    if (Inner.ends_with("]"))
+      Inner = Inner.drop_front(1).drop_back(1);
+    else
+      Inner = Inner.drop_front(1); // malformed, best-effort
+
+    // Recursively parse sub-operands.
+    SmallVector<StringRef, 4> Parts = splitOperands(Inner);
+    for (StringRef P : Parts) {
+      P = P.trim();
+      if (!P.empty())
+        Op.Children.push_back(parseAsmOperand(P));
+    }
+    // Store the full text too for fallback/display.
+    Op.Text = Token.str();
+    return Op;
+  }
+
+  Op.Text = Token.str();
+  return Op;
+}
+
+// E.g., "ldrb\tw12, [x0, #8]" -> ("ldrb", [AsmOperand("w12"), AsmOperand{Children: ["x0", "#8"]}])
+static void parseAsmText(const BinaryContext &BC, const MCInst &Inst,
+                         std::string &Mnemonic,
+                         SmallVectorImpl<AsmOperand> &Operands) {
+  std::string Buf;
+  raw_string_ostream OS(Buf);
+  BC.InstPrinter->printInst(&Inst, 0, "", *BC.STI, OS);
+  StringRef S(Buf);
+  S = S.ltrim();
+
+  // Split mnemonic from operands.
+  auto [M, Rest] = S.split('\t');
+  if (M.empty())
+    std::tie(M, Rest) = S.split(' ');
+  Mnemonic = M.str();
+
+  // Parse operands into AsmOperand tree.
+  if (!Rest.empty()) {
+    SmallVector<StringRef, 4> Parts = splitOperands(Rest);
+    for (StringRef P : Parts) {
+      P = P.trim();
+      if (!P.empty())
+        Operands.push_back(parseAsmOperand(P));
+    }
+  }
+}
+
 static std::vector<BBInfo> buildBBInfos(const BinaryContext &BC,
-                                        const BinaryFunction &BF) {
+                                        const BinaryFunction &BF,
+                                        bool ComputeLiveness = true) {
   unsigned NumRegs = BC.MRI->getNumRegs();
   std::vector<BBInfo> Infos;
   Infos.reserve(BF.size());
@@ -325,8 +438,10 @@ static std::vector<BBInfo> buildBBInfos(const BinaryContext &BC,
   for (const BinaryBasicBlock &BB : BF) {
     BBInfo Info;
     Info.BB = &BB;
-    Info.LiveIn.resize(NumRegs);
-    Info.LiveOut.resize(NumRegs);
+    if (ComputeLiveness) {
+      Info.LiveIn.resize(NumRegs);
+      Info.LiveOut.resize(NumRegs);
+    }
 
     unsigned InstIdx = 0;
     for (const MCInst &Inst : BB) {
@@ -334,18 +449,6 @@ static std::vector<BBInfo> buildBBInfos(const BinaryContext &BC,
       Node.Inst = &Inst;
       Node.BBIndex = BBIdx;
       Node.InstIndex = InstIdx++;
-
-      // Get the printed mnemonic by printing to a string and extracting the
-      // first token. Some instructions may not be printable; fall back to
-      // MCInstrInfo::getName() (which gives the tablegen opcode name).
-      {
-        std::string Buf;
-        raw_string_ostream OS(Buf);
-        BC.InstPrinter->printInst(&Inst, 0, "", *BC.STI, OS);
-        StringRef S(Buf);
-        S = S.ltrim();
-        Node.Mnemonic = S.substr(0, S.find_first_of(" \t")).str();
-      }
 
       computeInstrDefsUses(BC, Inst, Node.Defs, Node.Uses);
       Info.Nodes.push_back(std::move(Node));
@@ -355,7 +458,9 @@ static std::vector<BBInfo> buildBBInfos(const BinaryContext &BC,
     ++BBIdx;
   }
 
-  // Compute liveness: backward scan per BB.
+  // Compute liveness only when needed (linear matcher uses it for cross-BB
+  // matching; graph matcher builds its own def-use edges instead).
+  if (ComputeLiveness) {
   // First pass: compute local live-in from instructions.
   for (auto &Info : Infos) {
     BitVector Live(NumRegs);
@@ -406,6 +511,7 @@ static std::vector<BBInfo> buildBBInfos(const BinaryContext &BC,
       }
     }
   }
+  } // ComputeLiveness
 
   return Infos;
 }
@@ -737,6 +843,64 @@ static std::vector<PatternLine> parsePatternFile(StringRef Contents) {
   }
 
   return Lines;
+}
+
+/// A named pattern from a suite YAML file.
+struct NamedPattern {
+  std::string Name;
+  std::vector<PatternLine> Lines;
+};
+
+/// Parse a YAML suite file. Format:
+///   pattern_name:
+///     pattern: |
+///       mnemonic operands
+///       @annotation
+static std::vector<NamedPattern> parseSuiteFile(StringRef Contents) {
+  std::vector<NamedPattern> Suite;
+  SourceMgr SM;
+  yaml::Stream YS(Contents, SM);
+
+  for (yaml::Document &Doc : YS) {
+    auto *Root = dyn_cast_or_null<yaml::MappingNode>(Doc.getRoot());
+    if (!Root)
+      continue;
+
+    for (auto &Entry : *Root) {
+      auto *KeyNode = dyn_cast<yaml::ScalarNode>(Entry.getKey());
+      if (!KeyNode)
+        continue;
+      SmallString<64> KeyStorage;
+      StringRef Name = KeyNode->getValue(KeyStorage);
+
+      auto *ValMap = dyn_cast<yaml::MappingNode>(Entry.getValue());
+      if (!ValMap)
+        continue;
+
+      for (auto &Field : *ValMap) {
+        auto *FieldKey = dyn_cast<yaml::ScalarNode>(Field.getKey());
+        if (!FieldKey)
+          continue;
+        SmallString<32> FieldStorage;
+        if (FieldKey->getValue(FieldStorage) != "pattern")
+          continue;
+
+        StringRef PatText;
+        SmallString<256> PatStorage;
+        if (auto *PatNode = dyn_cast<yaml::ScalarNode>(Field.getValue()))
+          PatText = PatNode->getValue(PatStorage);
+        else if (auto *BSN = dyn_cast<yaml::BlockScalarNode>(Field.getValue()))
+          PatText = BSN->getValue();
+        else
+          continue;
+
+        auto Lines = parsePatternFile(PatText);
+        if (!Lines.empty())
+          Suite.push_back({Name.str(), std::move(Lines)});
+      }
+    }
+  }
+  return Suite;
 }
 
 // ===----------------------------------------------------------------------===//
@@ -1158,37 +1322,11 @@ static void dumpPatternDot(const std::vector<PatternLine> &Pattern,
   OS << "}\n";
 }
 
-// E.g., "ldrb\tw12, [x0, #8]" -> ("ldrb", ["w12", "[x0, #8]"])
-static void parseAsmText(const BinaryContext &BC, const MCInst &Inst,
-                         std::string &Mnemonic,
-                         SmallVectorImpl<std::string> &OpTokens) {
-  std::string Buf;
-  raw_string_ostream OS(Buf);
-  BC.InstPrinter->printInst(&Inst, 0, "", *BC.STI, OS);
-  StringRef S(Buf);
-  S = S.ltrim();
 
-  // Split mnemonic from operands.
-  auto [M, Rest] = S.split('\t');
-  if (M.empty())
-    std::tie(M, Rest) = S.split(' ');
-  Mnemonic = M.str();
-
-  // Bracket-aware operand splitting.
-  if (!Rest.empty()) {
-    SmallVector<StringRef, 4> Parts = splitOperands(Rest);
-    for (StringRef P : Parts) {
-      P = P.trim();
-      if (!P.empty())
-        OpTokens.push_back(P.str());
-    }
-  }
-}
-
-// Try to bind a pattern operand against a printed assembly operand token.
+// Try to bind a pattern operand against a parsed assembly operand.
 // Returns false if binding fails.
 static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
-                           StringRef Token, const InstrNode &Node,
+                           const AsmOperand &AsmOp, const InstrNode &Node,
                            StringMap<Binding> &Bindings) {
   if (PO.K == PatternOperand::Literal)
     return true; // Literals are hints, always pass.
@@ -1196,6 +1334,9 @@ static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
   // Rest: accepts all remaining tokens.
   if (PO.K == PatternOperand::Rest)
     return true;
+
+  // For leaf operands, use the text. For mem operands, use the full text.
+  StringRef Token = AsmOp.Text;
 
   // Check and strip prefix (e.g., "#").
   StringRef WorkToken = Token;
@@ -1205,30 +1346,23 @@ static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
     WorkToken = WorkToken.drop_front(PO.Prefix.size());
   }
 
-  // MemOperand: token is bracket group from parseAsmText.
+  // MemOperand: match against pre-parsed bracket structure.
   if (PO.K == PatternOperand::MemOperand) {
-    StringRef Inner = WorkToken;
-    // Strip brackets and optional ! suffix.
-    if (Inner.ends_with("!")) {
-      if (!PO.PreIndex)
-        return false;
-      Inner = Inner.drop_back(1);
-    } else if (PO.PreIndex) {
-      return false; // Pattern expects pre-index but token doesn't have it.
-    }
-    if (Inner.starts_with("[") && Inner.ends_with("]"))
-      Inner = Inner.drop_front(1).drop_back(1);
-    else
+    if (!AsmOp.isMem())
       return false;
 
-    // Split sub-tokens and bind recursively.
-    SmallVector<StringRef, 4> SubTokens = splitOperands(Inner);
-    if (PO.SubOperands.size() > SubTokens.size())
+    // Check pre-index agreement.
+    if (AsmOp.PreIndex != PO.PreIndex)
+      return false;
+
+    // Match sub-operands recursively.
+    if (PO.SubOperands.size() > AsmOp.Children.size())
       return false;
     for (unsigned I = 0; I < PO.SubOperands.size(); ++I) {
       if (PO.SubOperands[I].K == PatternOperand::Rest)
         break;
-      if (!tryBindOperand(BC, PO.SubOperands[I], SubTokens[I], Node, Bindings))
+      if (!tryBindOperand(BC, PO.SubOperands[I], AsmOp.Children[I], Node,
+                          Bindings))
         return false;
     }
     return true;
@@ -1454,10 +1588,12 @@ static bool matchLine(const BinaryContext &BC, const PatternLine &PL,
   if (PL.IsAnnotationOnly)
     return true;
 
-  // Parse the printed assembly.
-  std::string PrintedMnem;
-  SmallVector<std::string, 4> OpTokens;
-  parseAsmText(BC, *Node.Inst, PrintedMnem, OpTokens);
+  // Lazily parse printed assembly on first access.
+  Node.ensureParsed(BC);
+
+  // Use pre-parsed mnemonic and operands from InstrNode.
+  const std::string &PrintedMnem = Node.Mnemonic;
+  const auto &AsmOps = Node.Operands;
 
   // Mnemonic match: literal prefix + optional regex suffix.
   StringRef PrintedMnemRef(PrintedMnem);
@@ -1476,7 +1612,7 @@ static bool matchLine(const BinaryContext &BC, const PatternLine &PL,
   // Count non-NZCV explicit operands in pattern.
   // In v2, NZCV captures are handled via @defs/@uses annotations, but
   // they can also appear inline — we match all operands positionally.
-  if (PL.Operands.size() > OpTokens.size()) {
+  if (PL.Operands.size() > AsmOps.size()) {
     // Allow if last operand is Rest.
     if (PL.Operands.empty() || PL.Operands.back().K != PatternOperand::Rest)
       return false;
@@ -1485,13 +1621,13 @@ static bool matchLine(const BinaryContext &BC, const PatternLine &PL,
   for (unsigned I = 0; I < PL.Operands.size(); ++I) {
     if (PL.Operands[I].K == PatternOperand::Rest)
       break; // Rest matches remaining operands.
-    if (I >= OpTokens.size())
+    if (I >= AsmOps.size())
       return false;
     // Skip NZCV captures from positional matching (they're implicit).
     if (PL.Operands[I].K == PatternOperand::Capture &&
         PL.Operands[I].Type == "nzcv")
       continue;
-    if (!tryBindOperand(BC, PL.Operands[I], OpTokens[I], Node, Bindings))
+    if (!tryBindOperand(BC, PL.Operands[I], AsmOps[I], Node, Bindings))
       return false;
   }
 
@@ -1850,6 +1986,18 @@ static SmallVector<NodeID, 8> findGraphCandidates(
     }
   }
 
+  // Filter candidates by opcode name for early rejection (avoids printInst).
+  if (!PL.Mnemonic.empty()) {
+    std::string MnemUpper = StringRef(PL.Mnemonic).upper();
+    SmallVector<NodeID, 8> Filtered;
+    for (NodeID NID : Candidates) {
+      StringRef OpName = BC.MII->getName(G.Nodes[NID].Inst->getOpcode());
+      if (OpName.starts_with_insensitive(MnemUpper))
+        Filtered.push_back(NID);
+    }
+    return Filtered;
+  }
+
   return Candidates;
 }
 
@@ -2031,9 +2179,11 @@ static bool tryGraphMatch(const BinaryContext &BC,
     LLVM_DEBUG({
       dbgs() << "  Pattern line " << PatIdx << " ('" << PL.Mnemonic
              << "'): " << Candidates.size() << " candidates\n";
-      for (NodeID C : Candidates)
+      for (NodeID C : Candidates) {
+        G.Nodes[C].ensureParsed(BC);
         dbgs() << "    candidate NID=" << C << " mnem='"
                << G.Nodes[C].Mnemonic << "'\n";
+      }
     });
 
     bool Matched = false;
@@ -2107,9 +2257,53 @@ static void printMatchResult(const BinaryContext &BC, const MatchResult &Result,
   outs() << "\n";
 }
 
+/// Collect uppercase mnemonic prefixes from all non-annotation pattern lines.
+/// Used for opcode-level pre-filtering: a function must contain at least one
+/// instruction whose tablegen opcode name starts with each prefix.
+static SmallVector<std::string, 4>
+collectMnemPrefixes(const std::vector<PatternLine> &Pattern) {
+  SmallVector<std::string, 4> Prefixes;
+  for (const PatternLine &PL : Pattern) {
+    if (PL.IsAnnotationOnly || PL.Mnemonic.empty())
+      continue;
+    Prefixes.push_back(StringRef(PL.Mnemonic).upper());
+  }
+  // Deduplicate.
+  llvm::sort(Prefixes);
+  Prefixes.erase(llvm::unique(Prefixes), Prefixes.end());
+  return Prefixes;
+}
+
+/// Check if a function contains at least one instruction matching each prefix.
+static bool functionHasAllOpcodes(const BinaryContext &BC,
+                                  const BinaryFunction &BF,
+                                  const SmallVectorImpl<std::string> &Prefixes) {
+  if (Prefixes.empty())
+    return true;
+
+  // Bit per prefix: set when we find a matching opcode.
+  SmallBitVector Found(Prefixes.size());
+  unsigned Remaining = Prefixes.size();
+
+  for (const BinaryBasicBlock &BB : BF) {
+    for (const MCInst &Inst : BB) {
+      StringRef OpName = BC.MII->getName(Inst.getOpcode());
+      for (unsigned I = 0; I < Prefixes.size(); ++I) {
+        if (!Found[I] && OpName.starts_with_insensitive(Prefixes[I])) {
+          Found.set(I);
+          if (--Remaining == 0)
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 static void runLinearMatcher(const BinaryContext &BC,
                              const std::vector<PatternLine> &Pattern,
-                             unsigned &MatchCount) {
+                             unsigned &MatchCount,
+                             std::vector<std::pair<std::string, unsigned>> &FuncHits) {
   SmallVector<const BinaryFunction *, 0> Functions;
   for (const auto &[Addr, BF] : BC.getBinaryFunctions())
     Functions.push_back(&BF);
@@ -2119,19 +2313,47 @@ static void runLinearMatcher(const BinaryContext &BC,
   unsigned Total = Functions.size();
   bool ShowProgress = errs().is_displayed();
 
+  // Collect all pattern mnemonic prefixes for function-level pre-filter.
+  SmallVector<std::string, 4> Prefixes = collectMnemPrefixes(Pattern);
+
   DefaultThreadPool Pool(hardware_concurrency(opts::ThreadCount));
   for (unsigned FIdx = 0; FIdx < Functions.size(); ++FIdx) {
     Pool.async([&BC, &Pattern, &Functions, &AllResults, &Completed, Total,
-                ShowProgress, FIdx] {
+                ShowProgress, FIdx, &Prefixes] {
       const BinaryFunction &BF = *Functions[FIdx];
+
+      // Skip functions that don't contain all required opcodes.
+      if (!functionHasAllOpcodes(BC, BF, Prefixes)) {
+        if (ShowProgress) {
+          unsigned Done = ++Completed;
+          fprintf(stderr, "\rMatching: %u/%u functions (%u%%)", Done, Total,
+                  Done * 100 / Total);
+          fflush(stderr);
+        }
+        return;
+      }
+
       std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF);
       DenseSet<const MCInst *> LocalMatched;
+
+      // Pre-compute first pattern line mnemonic (uppercased) for fast opcode filtering.
+      const PatternLine &FirstPL = Pattern[0];
+      std::string FirstMnemUpper = StringRef(FirstPL.Mnemonic).upper();
 
       for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
         for (unsigned InstIdx = 0; InstIdx < AllBBs[BBIdx].Nodes.size();
              ++InstIdx) {
           if (LocalMatched.count(AllBBs[BBIdx].Nodes[InstIdx].Inst))
             continue;
+
+          // Fast opcode-level pre-filter: tablegen name starts with uppercase mnem.
+          const InstrNode &CandNode = AllBBs[BBIdx].Nodes[InstIdx];
+          if (!FirstMnemUpper.empty()) {
+            StringRef OpName = BC.MII->getName(CandNode.Inst->getOpcode());
+            if (!OpName.starts_with_insensitive(FirstMnemUpper))
+              continue;
+          }
+
           MatchResult Result;
           if (tryMatch(BC, Pattern, AllBBs, BBIdx, InstIdx, Result)) {
             const auto &[FirstBI, FirstIdx] = Result.MatchedInstrs.front();
@@ -2156,15 +2378,23 @@ static void runLinearMatcher(const BinaryContext &BC,
   if (ShowProgress)
     fprintf(stderr, "\r\033[K");
 
-  for (const auto &FR : AllResults)
-    for (const auto &Result : FR.Matches)
-      printMatchResult(BC, Result, ++MatchCount);
+  for (const auto &FR : AllResults) {
+    for (const auto &Result : FR.Matches) {
+      ++MatchCount;
+      if (opts::OutputLevel == opts::OM_Detailed)
+        printMatchResult(BC, Result, MatchCount);
+    }
+    if (!FR.Matches.empty())
+      FuncHits.emplace_back(FR.Matches.front().FunctionName,
+                            FR.Matches.size());
+  }
 }
 
 static void runGraphMatcher(const BinaryContext &BC,
                             const std::vector<PatternLine> &Pattern,
                             unsigned RootPatIdx,
-                            unsigned &MatchCount) {
+                            unsigned &MatchCount,
+                            std::vector<std::pair<std::string, unsigned>> &FuncHits) {
   SmallVector<const BinaryFunction *, 0> Functions;
   for (const auto &[Addr, BF] : BC.getBinaryFunctions())
     Functions.push_back(&BF);
@@ -2174,18 +2404,42 @@ static void runGraphMatcher(const BinaryContext &BC,
   unsigned Total = Functions.size();
   bool ShowProgress = errs().is_displayed();
 
+  // Collect all pattern mnemonic prefixes for function-level pre-filter.
+  SmallVector<std::string, 4> Prefixes = collectMnemPrefixes(Pattern);
+  std::string RootMnemUpper = StringRef(Pattern[RootPatIdx].Mnemonic).upper();
+
   DefaultThreadPool Pool(hardware_concurrency(opts::ThreadCount));
   for (unsigned FIdx = 0; FIdx < Functions.size(); ++FIdx) {
     Pool.async([&BC, &Pattern, RootPatIdx, &Functions, &AllResults, &Completed,
-                Total, ShowProgress, FIdx] {
+                Total, ShowProgress, FIdx, &Prefixes, &RootMnemUpper] {
       const BinaryFunction &BF = *Functions[FIdx];
-      std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF);
+
+      // Skip functions that don't contain all required opcodes.
+      if (!functionHasAllOpcodes(BC, BF, Prefixes)) {
+        if (ShowProgress) {
+          unsigned Done = ++Completed;
+          fprintf(stderr, "\rMatching: %u/%u functions (%u%%)", Done, Total,
+                  Done * 100 / Total);
+          fflush(stderr);
+        }
+        return;
+      }
+
+      std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF, /*ComputeLiveness=*/false);
       DefUseGraph G = buildDefUseGraph(AllBBs);
       DenseSet<const MCInst *> LocalMatched;
 
       for (NodeID NID = 0; NID < G.Nodes.size(); ++NID) {
         if (LocalMatched.count(G.Nodes[NID].Inst))
           continue;
+
+        // Fast opcode-level pre-filter: tablegen name starts with uppercase mnem.
+        const InstrNode &CandNode = G.Nodes[NID];
+        {
+          StringRef OpName = BC.MII->getName(CandNode.Inst->getOpcode());
+          if (!OpName.starts_with_insensitive(RootMnemUpper))
+            continue;
+        }
 
         MatchResult Result;
         if (tryGraphMatch(BC, Pattern, RootPatIdx, G, AllBBs, NID, Result)) {
@@ -2210,9 +2464,16 @@ static void runGraphMatcher(const BinaryContext &BC,
   if (ShowProgress)
     fprintf(stderr, "\r\033[K");
 
-  for (const auto &FR : AllResults)
-    for (const auto &Result : FR.Matches)
-      printMatchResult(BC, Result, ++MatchCount);
+  for (const auto &FR : AllResults) {
+    for (const auto &Result : FR.Matches) {
+      ++MatchCount;
+      if (opts::OutputLevel == opts::OM_Detailed)
+        printMatchResult(BC, Result, MatchCount);
+    }
+    if (!FR.Matches.empty())
+      FuncHits.emplace_back(FR.Matches.front().FunctionName,
+                            FR.Matches.size());
+  }
 }
 
 static void runMatcher(const BinaryContext &BC,
@@ -2309,14 +2570,27 @@ static void runMatcher(const BinaryContext &BC,
   }
 
   unsigned MatchCount = 0;
+  std::vector<std::pair<std::string, unsigned>> FuncHits;
   if (RootPatIdx >= 0) {
     bool Explicit = Pattern[RootPatIdx].IsRoot;
     outs() << "Using graph-based matcher ("
            << (Explicit ? "explicit" : "auto-detected") << " root at line "
            << RootPatIdx << ": " << Pattern[RootPatIdx].Mnemonic << ")\n";
-    runGraphMatcher(BC, Pattern, static_cast<unsigned>(RootPatIdx), MatchCount);
+    runGraphMatcher(BC, Pattern, static_cast<unsigned>(RootPatIdx), MatchCount,
+                    FuncHits);
   } else {
-    runLinearMatcher(BC, Pattern, MatchCount);
+    runLinearMatcher(BC, Pattern, MatchCount, FuncHits);
+  }
+
+  if (opts::OutputLevel == opts::OM_Summary) {
+    // Sort by hit count descending.
+    llvm::sort(FuncHits, [](const auto &A, const auto &B) {
+      if (A.second != B.second)
+        return A.second > B.second;
+      return A.first < B.first;
+    });
+    for (const auto &[Name, Count] : FuncHits)
+      outs() << "  " << Count << "\t" << Name << "\n";
   }
 
   outs() << "Total matches: " << MatchCount << "\n";
@@ -2384,7 +2658,8 @@ static void printFunctions(const BinaryContext &BC) {
 // ===----------------------------------------------------------------------===//
 
 static void processBinaryContext(const BinaryContext &BC,
-                                 const std::vector<PatternLine> &Pattern) {
+                                 const std::vector<PatternLine> &Pattern,
+                                 const std::vector<NamedPattern> &Suite) {
   if (opts::DumpFunctions)
     printFunctions(BC);
 
@@ -2395,6 +2670,12 @@ static void processBinaryContext(const BinaryContext &BC,
 
   if (!Pattern.empty())
     runMatcher(BC, Pattern);
+
+  for (const auto &NP : Suite) {
+    outs() << "--- " << NP.Name << " ---\n";
+    runMatcher(BC, NP.Lines);
+    outs() << "\n";
+  }
 }
 
 static auto makeProgressCallback() {
@@ -2414,18 +2695,25 @@ static void clearProgress() {
 }
 
 static void processMachO(MachOObjectFile *MachOObj, StringRef ToolPath,
-                          const std::vector<PatternLine> &Pattern) {
+                          const std::vector<PatternLine> &Pattern,
+                          const std::vector<NamedPattern> &Suite) {
   auto MachORIOrErr = MachORewriteInstance::create(MachOObj, ToolPath);
   if (Error E = MachORIOrErr.takeError())
     report_error(opts::InputFilename, std::move(E));
   MachORewriteInstance &MachORI = *MachORIOrErr.get();
   MachORI.setProgressCallback(makeProgressCallback());
-  MachORI.run();
+  {
+    TimeRegion TR(opts::TimeOpt ? &TBinary : nullptr);
+    MachORI.run();
+  }
   clearProgress();
   if (errs().is_displayed())
     fprintf(stderr, "Loaded %zu functions\n",
             MachORI.getBinaryContext().getBinaryFunctions().size());
-  processBinaryContext(MachORI.getBinaryContext(), Pattern);
+  {
+    TimeRegion TR(opts::TimeOpt ? &TMatch : nullptr);
+    processBinaryContext(MachORI.getBinaryContext(), Pattern, Suite);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -2480,8 +2768,27 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Parse suite file if provided.
+  std::vector<NamedPattern> Suite;
+  if (!opts::SuiteFilename.empty()) {
+    auto BufOrErr = MemoryBuffer::getFile(opts::SuiteFilename);
+    if (!BufOrErr)
+      report_error(opts::SuiteFilename, BufOrErr.getError());
+    Suite = parseSuiteFile((*BufOrErr)->getBuffer());
+    if (Suite.empty()) {
+      errs() << ToolName << ": no patterns found in suite '"
+             << opts::SuiteFilename << "'\n";
+      return EXIT_FAILURE;
+    }
+    outs() << "Loaded suite with " << Suite.size() << " pattern(s):";
+    for (const auto &NP : Suite)
+      outs() << " " << NP.Name;
+    outs() << "\n";
+  }
+
   // If no action specified, default to dump-functions.
-  if (!opts::DumpFunctions && !opts::DumpLiveness && Pattern.empty())
+  if (!opts::DumpFunctions && !opts::DumpLiveness && Pattern.empty() &&
+      Suite.empty())
     opts::DumpFunctions = true;
 
   if (!sys::fs::exists(opts::InputFilename))
@@ -2499,15 +2806,21 @@ int main(int argc, char **argv) {
       report_error(opts::InputFilename, std::move(E));
     RewriteInstance &RI = *RIOrErr.get();
     RI.setProgressCallback(makeProgressCallback());
-    if (Error E = RI.run())
-      report_error(opts::InputFilename, std::move(E));
+    {
+      TimeRegion TR(opts::TimeOpt ? &TBinary : nullptr);
+      if (Error E = RI.run())
+        report_error(opts::InputFilename, std::move(E));
+    }
     clearProgress();
     if (errs().is_displayed())
       fprintf(stderr, "Loaded %zu functions\n",
               RI.getBinaryContext().getBinaryFunctions().size());
-    processBinaryContext(RI.getBinaryContext(), Pattern);
+    {
+      TimeRegion TR(opts::TimeOpt ? &TMatch : nullptr);
+      processBinaryContext(RI.getBinaryContext(), Pattern, Suite);
+    }
   } else if (auto *MachOObj = dyn_cast<MachOObjectFile>(&Binary)) {
-    processMachO(MachOObj, ToolPath, Pattern);
+    processMachO(MachOObj, ToolPath, Pattern, Suite);
   } else if (auto *FatBin = dyn_cast<MachOUniversalBinary>(&Binary)) {
     StringRef Arch = opts::ArchName;
     if (Arch.empty()) {
@@ -2521,7 +2834,7 @@ int main(int argc, char **argv) {
     auto ObjOrErr = FatBin->getMachOObjectForArch(Arch);
     if (Error E = ObjOrErr.takeError())
       report_error(opts::InputFilename, std::move(E));
-    processMachO(ObjOrErr->get(), ToolPath, Pattern);
+    processMachO(ObjOrErr->get(), ToolPath, Pattern, Suite);
   } else {
     report_error(opts::InputFilename, object_error::invalid_file_type);
   }
