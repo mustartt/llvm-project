@@ -1254,6 +1254,28 @@ public:
     Regs |= getAliases(AArch64::FP);
   }
 
+  BitVector getRegsUsedAsParams() const override {
+    BitVector Regs = BitVector(RegInfo->getNumRegs(), false);
+    // AAPCS64: X0-X7 for integer/pointer, Q0-Q7 for FP/vector.
+    Regs |= getAliases(AArch64::X0);
+    Regs |= getAliases(AArch64::X1);
+    Regs |= getAliases(AArch64::X2);
+    Regs |= getAliases(AArch64::X3);
+    Regs |= getAliases(AArch64::X4);
+    Regs |= getAliases(AArch64::X5);
+    Regs |= getAliases(AArch64::X6);
+    Regs |= getAliases(AArch64::X7);
+    Regs |= getAliases(AArch64::Q0);
+    Regs |= getAliases(AArch64::Q1);
+    Regs |= getAliases(AArch64::Q2);
+    Regs |= getAliases(AArch64::Q3);
+    Regs |= getAliases(AArch64::Q4);
+    Regs |= getAliases(AArch64::Q5);
+    Regs |= getAliases(AArch64::Q6);
+    Regs |= getAliases(AArch64::Q7);
+    return Regs;
+  }
+
   const MCExpr *getTargetExprFor(MCInst &Inst, const MCExpr *Expr,
                                  MCContext &Ctx,
                                  uint32_t RelType) const override {

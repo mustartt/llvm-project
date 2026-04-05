@@ -96,6 +96,12 @@ static cl::opt<std::string>
                    cl::value_desc("filename"),
                    cl::Optional, cl::cat(MatchCategory));
 
+static cl::opt<std::string>
+    DumpGraph("dump-graph",
+              cl::desc("emit def-use graph as DOT for functions matching regex"),
+              cl::value_desc("regex"),
+              cl::Optional, cl::cat(MatchCategory));
+
 enum OutputMode { OM_Count, OM_Summary, OM_Detailed };
 static cl::opt<OutputMode> OutputLevel(
     cl::desc("output verbosity (default: count only)"),
@@ -209,7 +215,8 @@ struct DefUseGraph {
 };
 
 static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs,
-                                    const MCRegisterInfo &MRI) {
+                                    const BinaryContext &BC) {
+  const MCRegisterInfo &MRI = *BC.MRI;
   DefUseGraph G;
 
   // Step 1: Flatten all InstrNodes, record BB start offsets.
@@ -217,6 +224,23 @@ static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs,
     G.BBStart.push_back(G.Nodes.size());
     for (const InstrNode &N : AllBBs[BBIdx].Nodes)
       G.Nodes.push_back(N);
+  }
+
+  // Precompute callee-saved regunit set for call clobbering.
+  unsigned NumRegs = MRI.getNumRegs();
+  BitVector CalleeSaved(NumRegs);
+  BC.MIB->getCalleeSavedRegs(CalleeSaved);
+  // Expand to include sub-registers of callee-saved regs.
+  BitVector CalleeSavedExpanded(CalleeSaved);
+  for (unsigned Reg : CalleeSaved.set_bits()) {
+    for (MCPhysReg Sub : MRI.subregs(Reg))
+      CalleeSavedExpanded.set(Sub);
+  }
+  // Collect callee-saved regunits.
+  DenseSet<unsigned> CalleeSavedRUs;
+  for (unsigned Reg : CalleeSavedExpanded.set_bits()) {
+    for (MCRegUnit RU : MRI.regunits(Reg))
+      CalleeSavedRUs.insert(static_cast<unsigned>(RU));
   }
 
   // Step 2: Within each BB, track last definer per register unit.
@@ -254,6 +278,20 @@ static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs,
       for (MCPhysReg Reg : Node.Defs)
         for (MCRegUnit RU : MRI.regunits(Reg))
           LastDef[static_cast<unsigned>(RU)] = NID;
+
+      // Calls clobber all caller-saved registers.  MCInstrDesc only lists LR
+      // as an implicit def of BL, but a call actually destroys X0-X17, D0-D31,
+      // NZCV, etc.  Kill those LastDef entries so no stale def-use edges cross
+      // the call boundary.
+      if (BC.MIB->isCall(*Node.Inst)) {
+        SmallVector<unsigned, 16> ToErase;
+        for (auto &KV : LastDef) {
+          if (!CalleeSavedRUs.count(KV.first) && KV.second != NID)
+            ToErase.push_back(KV.first);
+        }
+        for (unsigned RU : ToErase)
+          LastDef.erase(RU);
+      }
     }
 
     PerBBLastDef[BBIdx] = std::move(LastDef);
@@ -289,6 +327,14 @@ static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs,
       for (MCPhysReg Reg : Node.Defs)
         for (MCRegUnit RU : MRI.regunits(Reg))
           DefinedSoFar.insert(static_cast<unsigned>(RU));
+      // Calls clobber caller-saved regunits — mark them as defined so that
+      // later uses in this BB don't appear as live-in.
+      if (BC.MIB->isCall(*Node.Inst)) {
+        for (unsigned RU = 0, E = MRI.getNumRegUnits(); RU < E; ++RU) {
+          if (!CalleeSavedRUs.count(RU))
+            DefinedSoFar.insert(RU);
+        }
+      }
     }
 
     // For each live-in use, find definer in predecessor BBs via regunits.
@@ -2723,7 +2769,7 @@ static void runGraphMatcher(const BinaryContext &BC,
       }
 
       std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF, /*ComputeLiveness=*/false);
-      DefUseGraph G = buildDefUseGraph(AllBBs, *BC.MRI);
+      DefUseGraph G = buildDefUseGraph(AllBBs, BC);
 
       // Run DP matcher for this function.
       std::vector<MatchResult> FuncMatches;
@@ -2885,6 +2931,381 @@ static void printFunctions(const BinaryContext &BC) {
   }
 }
 
+/// Escape a string for use inside a DOT label.
+static std::string dotEscape(StringRef S) {
+  std::string R;
+  R.reserve(S.size());
+  for (char C : S) {
+    switch (C) {
+    case '"':  R += "\\\""; break;
+    case '\\': R += "\\\\"; break;
+    case '<':  R += "\\<"; break;
+    case '>':  R += "\\>"; break;
+    case '{':  R += "\\{"; break;
+    case '}':  R += "\\}"; break;
+    case '|':  R += "\\|"; break;
+    case '\n': R += "\\n"; break;
+    default:   R += C; break;
+    }
+  }
+  return R;
+}
+
+/// Get single-line assembly text for an instruction.
+static std::string getInstText(const BinaryContext &BC, const MCInst &Inst) {
+  std::string Buf;
+  raw_string_ostream OS(Buf);
+  BC.InstPrinter->printInst(&Inst, 0, "", *BC.STI, OS);
+  // Trim leading whitespace and collapse tab to space.
+  StringRef S(Buf);
+  S = S.ltrim();
+  std::string R;
+  R.reserve(S.size());
+  for (char C : S)
+    R += (C == '\t') ? ' ' : C;
+  return R;
+}
+
+/// Escape a string for use inside an HTML label (Graphviz <<...>> labels).
+static std::string htmlEscape(StringRef S) {
+  std::string R;
+  R.reserve(S.size());
+  for (char C : S) {
+    switch (C) {
+    case '&':  R += "&amp;"; break;
+    case '<':  R += "&lt;"; break;
+    case '>':  R += "&gt;"; break;
+    case '"':  R += "&quot;"; break;
+    default:   R += C; break;
+    }
+  }
+  return R;
+}
+
+/// Pick an instruction background color string (HTML hex).
+static const char *instrColor(const BinaryContext &BC, const MCInst &Inst) {
+  if (BC.MIB->isCall(Inst))
+    return "#fff3cd"; // light yellow
+  if (BC.MII->get(Inst.getOpcode()).isReturn())
+    return "#f8d7da"; // light red
+  if (BC.MII->get(Inst.getOpcode()).isBranch())
+    return "#cfe2ff"; // light blue
+  return "#ffffff";   // white
+}
+
+/// Emit a function's def-use graph as Graphviz DOT.
+static void emitFunctionDot(const BinaryContext &BC,
+                            const BinaryFunction &BF,
+                            raw_ostream &OS) {
+  std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF, /*ComputeLiveness=*/false);
+  DefUseGraph G = buildDefUseGraph(AllBBs, BC);
+  const MCRegisterInfo &MRI = *BC.MRI;
+
+  // Detect argument live-ins: find uses of ABI parameter registers that
+  // have no in-function definer (no incoming def-use edge for that regunit).
+  BitVector ParamRegs = BC.MIB->getRegsUsedAsParams();
+
+  struct ArgLiveIn {
+    MCPhysReg Reg;
+    NodeID FirstUse;
+  };
+  SmallVector<ArgLiveIn, 8> ArgLiveIns;
+
+  {
+    DenseMap<unsigned, std::pair<MCPhysReg, NodeID>> FirstArgUse;
+
+    for (unsigned NID = 0; NID < G.Nodes.size(); ++NID) {
+      const InstrNode &Node = G.Nodes[NID];
+      for (MCPhysReg Reg : Node.Uses) {
+        if (!ParamRegs.test(Reg))
+          continue;
+        for (MCRegUnit RU : MRI.regunits(Reg)) {
+          unsigned U = static_cast<unsigned>(RU);
+          if (FirstArgUse.count(U))
+            continue;
+          // Check if this use has an in-graph def via InEdges.
+          // Skip self-edges (e.g. post-indexed ldr defines and uses the
+          // same base register) — the first iteration still needs the arg.
+          bool HasDef = false;
+          auto EIt = G.InEdges.find(NID);
+          if (EIt != G.InEdges.end()) {
+            for (unsigned EIdx : EIt->second) {
+              if (G.Edges[EIdx].Def == NID)
+                continue; // self-edge
+              for (MCRegUnit ERU : MRI.regunits(G.Edges[EIdx].Reg)) {
+                if (static_cast<unsigned>(ERU) == U) {
+                  HasDef = true;
+                  break;
+                }
+              }
+              if (HasDef)
+                break;
+            }
+          }
+          if (!HasDef) {
+            // Also skip if this regunit is defined by any earlier node
+            // (in program order) — means it's locally produced, not an arg.
+            bool DefinedEarlier = false;
+            for (unsigned D = 0; D < NID; ++D) {
+              for (MCPhysReg DReg : G.Nodes[D].Defs) {
+                for (MCRegUnit DRU : MRI.regunits(DReg)) {
+                  if (static_cast<unsigned>(DRU) == U) {
+                    DefinedEarlier = true;
+                    break;
+                  }
+                }
+                if (DefinedEarlier)
+                  break;
+              }
+              if (DefinedEarlier)
+                break;
+            }
+            if (!DefinedEarlier)
+              FirstArgUse[U] = {Reg, NID};
+          }
+        }
+      }
+    }
+
+    DenseSet<unsigned> SeenRegs;
+    for (auto &KV : FirstArgUse) {
+      if (SeenRegs.insert(KV.second.first).second)
+        ArgLiveIns.push_back({KV.second.first, KV.second.second});
+    }
+    llvm::sort(ArgLiveIns, [&](const ArgLiveIn &A, const ArgLiveIn &B) {
+      return MRI.getName(A.Reg) < MRI.getName(B.Reg);
+    });
+  }
+
+  // Count non-empty BBs to decide layout strategy.
+  unsigned NonEmptyBBs = 0;
+  for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
+    unsigned Start = G.BBStart[BBIdx];
+    unsigned End = (BBIdx + 1 < AllBBs.size()) ? G.BBStart[BBIdx + 1]
+                                                : G.Nodes.size();
+    if (Start < End)
+      NonEmptyBBs++;
+  }
+  bool IsSmall = NonEmptyBBs <= 8;
+
+  OS << "digraph \"" << dotEscape(BF.getPrintName()) << "\" {\n";
+  OS << "  rankdir=TB;\n";
+  OS << "  compound=true;\n";
+  OS << "  node [shape=plaintext, fontname=\"Courier\", fontsize=10];\n";
+  OS << "  edge [fontname=\"Courier\", fontsize=9];\n";
+  OS << "  newrank=true;\n";
+  // Graph title.
+  std::string FuncTitle = BF.getPrintName();
+  if (FuncTitle.size() > 60)
+    FuncTitle = FuncTitle.substr(0, 57) + "...";
+  OS << "  label=<<B>" << htmlEscape(FuncTitle) << "</B>>;\n";
+  OS << "  labelloc=t; fontname=\"Helvetica\"; fontsize=14;\n\n";
+
+  // ---- Left panel: linear disassembly listing ----
+  OS << "  listing [shape=plaintext, label=<\n";
+  OS << "    <TABLE BORDER=\"1\" CELLBORDER=\"0\" CELLSPACING=\"0\" "
+        "CELLPADDING=\"4\" BGCOLOR=\"#f8f9fa\">\n";
+
+  if (!ArgLiveIns.empty()) {
+    OS << "    <TR><TD COLSPAN=\"2\" BGCOLOR=\"#d1ecf1\" ALIGN=\"LEFT\">"
+          "<I>args: ";
+    for (unsigned I = 0; I < ArgLiveIns.size(); ++I) {
+      if (I > 0)
+        OS << ", ";
+      OS << MRI.getName(ArgLiveIns[I].Reg);
+    }
+    OS << "</I></TD></TR>\n";
+  }
+
+  for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
+    unsigned Start = G.BBStart[BBIdx];
+    unsigned End = (BBIdx + 1 < AllBBs.size()) ? G.BBStart[BBIdx + 1]
+                                                : G.Nodes.size();
+    if (Start == End)
+      continue;
+    OS << "    <TR><TD COLSPAN=\"2\" BGCOLOR=\"#e2e3e5\" ALIGN=\"LEFT\">"
+          "<B>" << htmlEscape(AllBBs[BBIdx].BB->getName()) << ":</B>"
+          "</TD></TR>\n";
+    for (unsigned NID = Start; NID < End; ++NID) {
+      std::string Text = getInstText(BC, *G.Nodes[NID].Inst);
+      const char *Color = instrColor(BC, *G.Nodes[NID].Inst);
+      OS << "    <TR><TD PORT=\"p" << NID << "\" BGCOLOR=\"" << Color
+         << "\" ALIGN=\"LEFT\"><FONT POINT-SIZE=\"9\" COLOR=\"#6c757d\">"
+         << NID << "</FONT></TD>"
+         << "<TD BGCOLOR=\"" << Color << "\" ALIGN=\"LEFT\">"
+         << htmlEscape(Text) << "</TD></TR>\n";
+    }
+  }
+  OS << "    </TABLE>\n  >];\n\n";
+
+  // ---- Argument live-in nodes (small functions only) ----
+  if (IsSmall && !ArgLiveIns.empty()) {
+    for (unsigned I = 0; I < ArgLiveIns.size(); ++I) {
+      OS << "  arg" << I << " [label=\""
+         << MRI.getName(ArgLiveIns[I].Reg) << "\""
+         << ", shape=ellipse, style=\"filled,bold\""
+         << ", fillcolor=\"#d1ecf1\", color=\"#0c5460\""
+         << ", fontname=\"Courier\", fontsize=10];\n";
+    }
+    OS << "\n";
+  }
+
+  // ---- Graph: individual instruction nodes inside BB clusters ----
+  DenseMap<const BinaryBasicBlock *, unsigned> BBPtrToIdx;
+  for (unsigned I = 0; I < AllBBs.size(); ++I)
+    BBPtrToIdx[AllBBs[I].BB] = I;
+
+  for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
+    unsigned Start = G.BBStart[BBIdx];
+    unsigned End = (BBIdx + 1 < AllBBs.size()) ? G.BBStart[BBIdx + 1]
+                                                : G.Nodes.size();
+    if (Start == End)
+      continue;
+
+    OS << "  subgraph cluster_bb" << BBIdx << " {\n";
+    OS << "    label=<<B>" << htmlEscape(AllBBs[BBIdx].BB->getName())
+       << "</B>>;\n";
+    OS << "    style=bold; color=\"#495057\"; penwidth=2; "
+          "fontname=\"Helvetica\"; fontsize=11;\n";
+    OS << "    labeljust=l;\n";
+
+    for (unsigned NID = Start; NID < End; ++NID) {
+      std::string Text = getInstText(BC, *G.Nodes[NID].Inst);
+      const char *Color = instrColor(BC, *G.Nodes[NID].Inst);
+      OS << "    n" << NID
+         << " [label=<<FONT>" << htmlEscape(Text) << "</FONT>>"
+         << ", shape=box, style=filled"
+         << ", fillcolor=\"" << Color << "\"];\n";
+    }
+
+    // Invisible chain for instruction ordering.
+    if (End - Start > 1) {
+      OS << "    ";
+      for (unsigned NID = Start; NID < End; ++NID) {
+        if (NID > Start)
+          OS << " -> ";
+        OS << "n" << NID;
+      }
+      OS << " [style=invis, weight=10];\n";
+    }
+
+    OS << "  }\n\n";
+  }
+
+  // ---- Layout ----
+  if (IsSmall) {
+    // Side-by-side: all BB heads + listing on the same rank.
+    OS << "  { rank=same; listing;";
+    for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
+      unsigned Start = G.BBStart[BBIdx];
+      unsigned End = (BBIdx + 1 < AllBBs.size()) ? G.BBStart[BBIdx + 1]
+                                                  : G.Nodes.size();
+      if (Start < End)
+        OS << " n" << Start << ";";
+    }
+    OS << " }\n";
+    if (!ArgLiveIns.empty())
+      OS << "  arg0 -> n0 [style=invis];\n";
+  } else {
+    // Free layout: pin listing next to first node.
+    if (!G.Nodes.empty())
+      OS << "  { rank=same; listing; n0; }\n";
+  }
+  OS << "\n";
+
+  // ---- Control flow edges ----
+  for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
+    unsigned Start = G.BBStart[BBIdx];
+    unsigned End = (BBIdx + 1 < AllBBs.size()) ? G.BBStart[BBIdx + 1]
+                                                : G.Nodes.size();
+    if (Start == End)
+      continue;
+    unsigned LastNID = End - 1;
+
+    for (const BinaryBasicBlock *Succ : AllBBs[BBIdx].BB->successors()) {
+      auto It = BBPtrToIdx.find(Succ);
+      if (It == BBPtrToIdx.end())
+        continue;
+      unsigned SuccIdx = It->second;
+      unsigned SuccStart = G.BBStart[SuccIdx];
+      unsigned SuccEnd = (SuccIdx + 1 < AllBBs.size())
+                             ? G.BBStart[SuccIdx + 1]
+                             : G.Nodes.size();
+      if (SuccStart == SuccEnd)
+        continue;
+
+      OS << "  n" << LastNID << " -> n" << SuccStart
+         << " [style=bold, penwidth=2, color=\"#343a40\""
+         << ", arrowsize=1.2";
+      if (IsSmall)
+        OS << ", constraint=false, weight=0";
+      if (SuccIdx != BBIdx) {
+        OS << ", lhead=cluster_bb" << SuccIdx
+           << ", ltail=cluster_bb" << BBIdx;
+      }
+      OS << "];\n";
+    }
+  }
+  OS << "\n";
+
+  // ---- Argument live-in edges (small functions only) ----
+  if (IsSmall) {
+    for (unsigned I = 0; I < ArgLiveIns.size(); ++I) {
+      OS << "  arg" << I << " -> n" << ArgLiveIns[I].FirstUse
+         << " [label=\"" << MRI.getName(ArgLiveIns[I].Reg) << "\""
+         << ", color=\"#0c5460\", style=bold, penwidth=1.5];\n";
+    }
+  }
+
+  // ---- All def-use edges ----
+  for (const auto &E : G.Edges) {
+    OS << "  n" << E.Def << " -> n" << E.Use
+       << " [label=\"" << BC.MRI->getName(E.Reg) << "\"";
+    if (G.Nodes[E.Def].BBIndex != G.Nodes[E.Use].BBIndex)
+      OS << ", style=dashed, color=red";
+    else
+      OS << ", color=\"#0d6efd\"";
+    OS << "];\n";
+  }
+
+  OS << "}\n";
+}
+
+/// Dump def-use graphs for all functions matching the given regex.
+static void dumpGraphs(const BinaryContext &BC, StringRef RegexStr) {
+  Regex RE(RegexStr);
+  std::string Err;
+  if (!RE.isValid(Err)) {
+    errs() << ToolName << ": invalid regex '" << RegexStr << "': " << Err
+           << "\n";
+    return;
+  }
+
+  unsigned Count = 0;
+  for (const auto &[Addr, BF] : BC.getBinaryFunctions()) {
+    if (!RE.match(BF.getPrintName()))
+      continue;
+
+    std::string Filename =
+        ("graph_" + Twine(Count++) + ".dot").str();
+    std::error_code EC;
+    raw_fd_ostream File(Filename, EC);
+    if (EC) {
+      report_error(Filename, EC);
+      continue;
+    }
+
+    emitFunctionDot(BC, BF, File);
+    outs() << "Wrote " << BF.getPrintName() << " → " << Filename
+           << " (" << BF.size() << " BBs)\n";
+  }
+
+  if (Count == 0)
+    outs() << "No functions matched '" << RegexStr << "'\n";
+  else
+    outs() << Count << " graph(s) written.\n";
+}
+
 // ===----------------------------------------------------------------------===//
 // Binary loading (reused from previous implementation)
 // ===----------------------------------------------------------------------===//
@@ -2899,6 +3320,9 @@ static void processBinaryContext(const BinaryContext &BC,
     for (const auto &[Addr, BF] : BC.getBinaryFunctions())
       printLiveness(BC, BF);
   }
+
+  if (opts::DumpGraph.getNumOccurrences())
+    dumpGraphs(BC, opts::DumpGraph);
 
   if (!Pattern.empty())
     runMatcher(BC, Pattern);
@@ -3020,7 +3444,7 @@ int main(int argc, char **argv) {
 
   // If no action specified, default to dump-functions.
   if (!opts::DumpFunctions && !opts::DumpLiveness && Pattern.empty() &&
-      Suite.empty())
+      Suite.empty() && !opts::DumpGraph.getNumOccurrences())
     opts::DumpFunctions = true;
 
   if (!sys::fs::exists(opts::InputFilename))
