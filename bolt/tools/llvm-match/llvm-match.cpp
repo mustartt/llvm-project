@@ -15,6 +15,7 @@
 #include "bolt/Core/BinaryBasicBlock.h"
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryFunction.h"
+#include "bolt/Core/MCPlus.h"
 #include "bolt/Rewrite/MachORewriteInstance.h"
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "bolt/Utils/CommandLineOpts.h"
@@ -23,6 +24,15 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/CodeGen/MIRPrinter.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
@@ -43,7 +53,11 @@
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/YAMLParser.h"
 #include "llvm/Support/Timer.h"
+#include "llvm/Target/TargetMachine.h"
+#include <triskel/triskel.hpp>
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 
 #define DEBUG_TYPE "llvm-match"
@@ -56,15 +70,22 @@ namespace opts {
 
 static cl::OptionCategory MatchCategory("llvm-match options");
 
+// --- extract subcommand ---
+static cl::SubCommand ExtractCmd("extract",
+    "Extract functions as MIR files in Machine SSA form");
+
 static cl::opt<std::string> InputFilename(cl::Positional,
                                           cl::desc("<executable>"),
                                           cl::Required,
                                           cl::cat(MatchCategory),
-                                          cl::sub(cl::SubCommand::getAll()));
+                                          cl::sub(cl::SubCommand::getTopLevel()),
+                                          cl::sub(ExtractCmd));
 
 static cl::opt<std::string>
     ArchName("arch", cl::desc("architecture slice for universal binaries"),
-             cl::Optional, cl::cat(MatchCategory));
+             cl::Optional, cl::cat(MatchCategory),
+             cl::sub(cl::SubCommand::getTopLevel()),
+             cl::sub(ExtractCmd));
 
 static cl::opt<std::string>
     PatternFilename("pattern", cl::desc("pattern file for matching"),
@@ -102,6 +123,12 @@ static cl::opt<std::string>
               cl::value_desc("regex"),
               cl::Optional, cl::cat(MatchCategory));
 
+static cl::opt<std::string>
+    DumpSvg("dump-svg",
+            cl::desc("emit CFG as SVG for functions matching regex (uses Triskel SESE layout)"),
+            cl::value_desc("regex"),
+            cl::Optional, cl::cat(MatchCategory));
+
 enum OutputMode { OM_Count, OM_Summary, OM_Detailed };
 static cl::opt<OutputMode> OutputLevel(
     cl::desc("output verbosity (default: count only)"),
@@ -114,6 +141,18 @@ static cl::opt<OutputMode> OutputLevel(
 static cl::opt<bool>
     TimeOpt("time", cl::desc("print timing breakdown"),
             cl::Optional, cl::cat(MatchCategory));
+
+static cl::opt<std::string>
+    OutDir("out-dir",
+           cl::desc("Output directory for .mir files"),
+           cl::Required, cl::cat(MatchCategory),
+           cl::sub(ExtractCmd));
+
+static cl::opt<std::string>
+    ExtractFilter("filter",
+                  cl::desc("Regex filter for function names to extract"),
+                  cl::Optional, cl::cat(MatchCategory),
+                  cl::sub(ExtractCmd));
 
 } // namespace opts
 
@@ -3271,6 +3310,216 @@ static void emitFunctionDot(const BinaryContext &BC,
   OS << "}\n";
 }
 
+// ===----------------------------------------------------------------------===//
+// SVG CFG output (via Triskel SESE layout)
+// ===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Lightweight SVG renderer implementing the triskel::ExportingRenderer
+/// interface.  Accumulates SVG elements into a string buffer — no Cairo or
+/// any other external rendering library needed.
+class SvgRenderer : public triskel::ExportingRenderer {
+  std::string Buf;
+  float Width = 0, Height = 0;
+
+  static std::string colorStr(triskel::Color C) {
+    char Hex[8];
+    snprintf(Hex, sizeof(Hex), "#%02x%02x%02x", C.r, C.g, C.b);
+    return Hex;
+  }
+
+public:
+  void begin(float W, float H) override {
+    Width = W + 2 * PADDING;
+    Height = H + 2 * PADDING;
+    Buf.clear();
+    // Apply PADDING translation via an SVG group transform (matching Cairo
+    // renderer behavior).
+    Buf += "<g transform=\"translate(" + std::to_string(PADDING) + "," +
+           std::to_string(PADDING) + ")\">\n";
+  }
+
+  void end() override { Buf += "</g>\n"; }
+
+  void draw_line(triskel::Point S, triskel::Point E,
+                 const StrokeStyle &St) override {
+    Buf += "<line x1=\"" + std::to_string(S.x) + "\" y1=\"" +
+           std::to_string(S.y) + "\" x2=\"" + std::to_string(E.x) +
+           "\" y2=\"" + std::to_string(E.y) + "\" stroke=\"" +
+           colorStr(St.color) + "\" stroke-width=\"" +
+           std::to_string(St.thickness) + "\"/>\n";
+  }
+
+  void draw_triangle(triskel::Point V1, triskel::Point V2, triskel::Point V3,
+                     triskel::Color Fill) override {
+    Buf += "<polygon points=\"" + std::to_string(V1.x) + "," +
+           std::to_string(V1.y) + " " + std::to_string(V2.x) + "," +
+           std::to_string(V2.y) + " " + std::to_string(V3.x) + "," +
+           std::to_string(V3.y) + "\" fill=\"" + colorStr(Fill) + "\"/>\n";
+  }
+
+  void draw_rectangle(triskel::Point TL, float W, float H,
+                      triskel::Color Fill) override {
+    Buf += "<rect x=\"" + std::to_string(TL.x) + "\" y=\"" +
+           std::to_string(TL.y) + "\" width=\"" + std::to_string(W) +
+           "\" height=\"" + std::to_string(H) + "\" fill=\"" +
+           colorStr(Fill) + "\"/>\n";
+  }
+
+  void draw_rectangle_border(triskel::Point TL, float W, float H,
+                             const StrokeStyle &St) override {
+    Buf += "<rect x=\"" + std::to_string(TL.x) + "\" y=\"" +
+           std::to_string(TL.y) + "\" width=\"" + std::to_string(W) +
+           "\" height=\"" + std::to_string(H) + "\" fill=\"none\" stroke=\"" +
+           colorStr(St.color) + "\" stroke-width=\"" +
+           std::to_string(St.thickness) + "\"/>\n";
+  }
+
+  void draw_text(triskel::Point TL, const std::string &Text,
+                 const TextStyle &St) override {
+    // Offset by BLOCK_PADDING (matching Cairo renderer) so text sits inside
+    // the basic-block rectangle.
+    float X = TL.x + BLOCK_PADDING;
+    float Y = TL.y + BLOCK_PADDING + STYLE_TEXT.line_height;
+    size_t Pos = 0;
+    while (Pos < Text.size()) {
+      size_t NL = Text.find('\n', Pos);
+      if (NL == std::string::npos)
+        NL = Text.size();
+      std::string Line = htmlEscape(StringRef(Text).slice(Pos, NL));
+      Buf += "<text x=\"" + std::to_string(X) + "\" y=\"" +
+             std::to_string(Y) +
+             "\" font-family=\"Courier,monospace\" font-size=\"" +
+             std::to_string(St.size) + "\" fill=\"" + colorStr(St.color) +
+             "\">" + Line + "</text>\n";
+      Y += St.line_height;
+      Pos = NL + 1;
+    }
+  }
+
+  auto measure_text(const std::string &Text,
+                    const TextStyle &St) const -> triskel::Point override {
+    // Estimate dimensions for monospace font.
+    float CharW = St.size * 0.6f;
+    unsigned MaxCols = 0, Lines = 0;
+    unsigned Col = 0;
+    for (char C : Text) {
+      if (C == '\n') {
+        MaxCols = std::max(MaxCols, Col);
+        Col = 0;
+        ++Lines;
+      } else {
+        ++Col;
+      }
+    }
+    if (Col > 0)
+      ++Lines;
+    MaxCols = std::max(MaxCols, Col);
+    float W = MaxCols * CharW + 2 * BLOCK_PADDING;
+    float H = Lines * St.line_height + 2 * BLOCK_PADDING;
+    return {W, H};
+  }
+
+  void save(const std::filesystem::path &Path) override {
+    std::string Svg;
+    Svg += "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    Svg += "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" +
+           std::to_string(Width) + "\" height=\"" + std::to_string(Height) +
+           "\">\n";
+    Svg += "<rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n";
+    Svg += Buf;
+    Svg += "</svg>\n";
+
+    std::ofstream Ofs(Path);
+    Ofs << Svg;
+  }
+};
+
+} // anonymous namespace
+
+/// Emit a function's CFG as SVG using Triskel SESE-aware layout.
+static void emitFunctionSvg(const BinaryContext &BC, const BinaryFunction &BF,
+                             const std::filesystem::path &OutPath) {
+  std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF, /*ComputeLiveness=*/false);
+
+  SvgRenderer Renderer;
+  auto Builder = triskel::make_layout_builder();
+
+  // Map BB index → triskel node ID.
+  std::vector<size_t> NodeIDs;
+  NodeIDs.reserve(AllBBs.size());
+
+  for (const BBInfo &BI : AllBBs) {
+    std::string Label;
+    // BB header line.
+    Label += ("BB#" + Twine(BI.Nodes.empty() ? 0 : BI.Nodes[0].BBIndex)).str();
+    if (BI.BB->isEntryPoint())
+      Label += " (entry)";
+    Label += "\n";
+    for (const InstrNode &N : BI.Nodes) {
+      Label += getInstText(BC, *N.Inst);
+      Label += "\n";
+    }
+    if (!Label.empty() && Label.back() == '\n')
+      Label.pop_back();
+    NodeIDs.push_back(Builder->make_node(Renderer, Label));
+  }
+
+  // Add CFG edges.
+  for (unsigned I = 0; I < AllBBs.size(); ++I) {
+    const BinaryBasicBlock *BB = AllBBs[I].BB;
+    const BinaryBasicBlock *CondSucc = BB->getConditionalSuccessor(false);
+    for (BinaryBasicBlock *Succ : BB->successors()) {
+      // Find successor's index in AllBBs.
+      unsigned TargetIdx = 0;
+      for (unsigned J = 0; J < AllBBs.size(); ++J) {
+        if (AllBBs[J].BB == Succ) {
+          TargetIdx = J;
+          break;
+        }
+      }
+      auto ET = triskel::LayoutBuilder::EdgeType::Default;
+      if (BB->succ_size() == 2) {
+        ET = (Succ == CondSucc)
+                 ? triskel::LayoutBuilder::EdgeType::True
+                 : triskel::LayoutBuilder::EdgeType::False;
+      }
+      Builder->make_edge(NodeIDs[I], NodeIDs[TargetIdx], ET);
+    }
+  }
+
+  auto Layout = Builder->build();
+  Layout->render_and_save(Renderer, OutPath);
+}
+
+/// Dump CFG SVGs for all functions matching the given regex.
+static void dumpSvgGraphs(const BinaryContext &BC, StringRef RegexStr) {
+  Regex RE(RegexStr);
+  std::string Err;
+  if (!RE.isValid(Err)) {
+    errs() << ToolName << ": invalid regex '" << RegexStr << "': " << Err
+           << "\n";
+    return;
+  }
+
+  unsigned Count = 0;
+  for (const auto &[Addr, BF] : BC.getBinaryFunctions()) {
+    if (!RE.match(BF.getPrintName()))
+      continue;
+
+    std::string Filename = ("graph_" + Twine(Count++) + ".svg").str();
+    emitFunctionSvg(BC, BF, Filename);
+    outs() << "Wrote " << BF.getPrintName() << " -> " << Filename << " ("
+           << BF.size() << " BBs)\n";
+  }
+
+  if (Count == 0)
+    outs() << "No functions matched '" << RegexStr << "'\n";
+  else
+    outs() << Count << " SVG(s) written.\n";
+}
+
 /// Dump def-use graphs for all functions matching the given regex.
 static void dumpGraphs(const BinaryContext &BC, StringRef RegexStr) {
   Regex RE(RegexStr);
@@ -3307,6 +3556,1115 @@ static void dumpGraphs(const BinaryContext &BC, StringRef RegexStr) {
 }
 
 // ===----------------------------------------------------------------------===//
+// MIR extraction — convert BinaryFunction to MachineFunction in SSA form
+// ===----------------------------------------------------------------------===//
+
+/// Sanitize a function name for use as a filename.
+static std::string sanitizeFilename(StringRef Name) {
+  std::string Result;
+  Result.reserve(Name.size());
+  for (char C : Name) {
+    if (C == '/' || C == '\\' || C == '<' || C == '>' || C == ':' ||
+        C == '"' || C == '|' || C == '?' || C == '*' || C == ' ')
+      Result.push_back('_');
+    else
+      Result.push_back(C);
+  }
+  // Truncate overly long names.
+  if (Result.size() > 200)
+    Result.resize(200);
+  return Result;
+}
+
+/// Convert a single BinaryFunction to a MachineFunction in Machine SSA form
+/// and write it as a .mir file.
+static bool extractFunctionToMIR(const BinaryContext &BC,
+                                 const BinaryFunction &BF,
+                                 TargetMachine &TM,
+                                 MachineModuleInfo &MMI,
+                                 Module &IRMod,
+                                 const std::string &OutDir) {
+  LLVMContext &Ctx = IRMod.getContext();
+
+  // Skip functions with no basic blocks.
+  if (BF.empty())
+    return false;
+
+  // Create a dummy IR function for this binary function.
+  auto *FuncTy = FunctionType::get(Type::getVoidTy(Ctx), false);
+  std::string FuncName = BF.getPrintName();
+  auto *IRFunc = Function::Create(FuncTy, GlobalValue::ExternalLinkage,
+                                  FuncName, &IRMod);
+
+  // Get or create the MachineFunction.
+  MachineFunction &MF = MMI.getOrCreateMachineFunction(*IRFunc);
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  const TargetSubtargetInfo &STI = MF.getSubtarget();
+  const TargetInstrInfo *TII = STI.getInstrInfo();
+  const TargetRegisterInfo *TRI = STI.getRegisterInfo();
+
+  // Safe wrapper: getMinimalPhysRegClass asserts for registers with no class.
+  auto safeGetRC = [&](MCPhysReg Reg) -> const TargetRegisterClass * {
+    for (const TargetRegisterClass *RC : TRI->regclasses())
+      if (RC->contains(Reg))
+        return TRI->getMinimalPhysRegClass(Reg);
+    return nullptr;
+  };
+
+  // Mark as SSA with tracked liveness.
+  MF.getProperties().setIsSSA();
+  MF.getProperties().setTracksLiveness();
+
+  // Build BB infos and def-use graph from BOLT.
+  std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF, /*ComputeLiveness=*/false);
+  if (AllBBs.empty()) {
+    MMI.deleteMachineFunctionFor(*IRFunc);
+    IRFunc->eraseFromParent();
+    return false;
+  }
+  DefUseGraph DUG = buildDefUseGraph(AllBBs, BC);
+
+  // Create MachineBasicBlocks and record mapping.
+  std::vector<MachineBasicBlock *> MBBs;
+  MBBs.reserve(AllBBs.size());
+  DenseMap<const BinaryBasicBlock *, MachineBasicBlock *> BBMap;
+  for (unsigned I = 0; I < AllBBs.size(); ++I) {
+    MachineBasicBlock *MBB = MF.CreateMachineBasicBlock();
+    MF.push_back(MBB);
+    MBBs.push_back(MBB);
+    BBMap[AllBBs[I].BB] = MBB;
+  }
+
+  // Set up CFG successor edges.
+  for (unsigned I = 0; I < AllBBs.size(); ++I) {
+    const BinaryBasicBlock *BB = AllBBs[I].BB;
+    for (const BinaryBasicBlock *Succ : BB->successors()) {
+      auto It = BBMap.find(Succ);
+      if (It != BBMap.end())
+        MBBs[I]->addSuccessor(It->second);
+    }
+  }
+
+  // --- SSA Construction ---
+  // For each instruction def in the DefUseGraph, allocate a virtual register.
+  // Use the register class from the instruction's operand descriptor rather
+  // than getMinimalPhysRegClass, so we get natural classes (e.g. GPR32 instead
+  // of matrixindexgpr32_8_11).
+  // Map: (NodeID, PhysReg) → VReg
+  DenseMap<std::pair<NodeID, MCPhysReg>, Register> DefToVReg;
+
+  for (unsigned NID = 0; NID < DUG.Nodes.size(); ++NID) {
+    const InstrNode &Node = DUG.Nodes[NID];
+    const MCInst &Inst = *Node.Inst;
+    if (BC.MIB->isPseudo(Inst))
+      continue;
+    const MCInstrDesc &MCID = BC.MII->get(Inst.getOpcode());
+    unsigned NumPrimeOps = MCPlus::getNumPrimeOperands(Inst);
+
+    // Explicit def operands — use the register class from the MCInstrDesc.
+    for (unsigned I = 0; I < NumPrimeOps && I < MCID.getNumDefs(); ++I) {
+      const MCOperand &MCOp = Inst.getOperand(I);
+      if (!MCOp.isReg() || MCOp.getReg() == 0)
+        continue;
+      MCPhysReg PReg = MCOp.getReg();
+
+      const TargetRegisterClass *RC = nullptr;
+      if (I < MCID.getNumOperands()) {
+        int16_t RCIdx = MCID.operands()[I].RegClass;
+        if (RCIdx >= 0)
+          RC = TRI->getRegClass(RCIdx);
+      }
+      // Fallback to getMinimalPhysRegClass if no operand info available.
+      if (!RC)
+        RC = safeGetRC(PReg);
+      if (!RC || !RC->isAllocatable())
+        continue;
+      Register VReg = MRI.createVirtualRegister(RC);
+      DefToVReg[{NID, PReg}] = VReg;
+    }
+
+    // Implicit defs — these don't have operand descriptors, use
+    // getMinimalPhysRegClass.
+    for (MCPhysReg Reg : Node.Defs) {
+      if (DefToVReg.count({NID, Reg}))
+        continue; // Already handled as explicit def.
+      const TargetRegisterClass *RC = safeGetRC(Reg);
+      if (!RC || !RC->isAllocatable())
+        continue;
+      Register VReg = MRI.createVirtualRegister(RC);
+      DefToVReg[{NID, Reg}] = VReg;
+    }
+  }
+
+  // --- Function live-ins: COPY physical arg registers to vregs ---
+  // Identify physical registers used without a def in the graph (arguments,
+  // callee-saved regs like LR/FP).  COPY each to a vreg at the entry block
+  // so every subsequent use references a vreg, satisfying SSA.
+  DenseMap<MCPhysReg, Register> LiveInVReg; // PhysReg → VReg from entry COPY
+  // Build BB index map for predecessor lookup (used here and in PHI building).
+  DenseMap<const BinaryBasicBlock *, unsigned> BBIdxMap;
+  for (unsigned I = 0; I < AllBBs.size(); ++I)
+    BBIdxMap[AllBBs[I].BB] = I;
+  {
+    DenseSet<MCPhysReg> LiveIns;
+
+    for (unsigned NID = 0; NID < DUG.Nodes.size(); ++NID) {
+      for (MCPhysReg Reg : DUG.Nodes[NID].Uses) {
+        // Check if any in-edge provides a def for this register.
+        bool HasDef = false;
+        auto InIt = DUG.InEdges.find(NID);
+        if (InIt != DUG.InEdges.end()) {
+          for (unsigned EIdx : InIt->second) {
+            const DefUseEdge &E = DUG.Edges[EIdx];
+            for (MCRegUnit RU1 : BC.MRI->regunits(Reg))
+              for (MCRegUnit RU2 : BC.MRI->regunits(E.Reg))
+                if (RU1 == RU2)
+                  HasDef = true;
+          }
+        }
+        if (!HasDef) {
+          LiveIns.insert(Reg);
+          continue;
+        }
+
+        // Even if a def exists in the DUG, the register is still a live-in
+        // if any predecessor of the use's BB doesn't provide a def (e.g.,
+        // loop-carried values where the first iteration uses a function arg).
+        unsigned UseBBIdx = DUG.Nodes[NID].BBIndex;
+        // Only check for cross-BB edges (live-in uses).
+        bool IsCrossBBUse = false;
+        if (InIt != DUG.InEdges.end()) {
+          for (unsigned EIdx : InIt->second) {
+            const DefUseEdge &E = DUG.Edges[EIdx];
+            bool RegMatch = false;
+            for (MCRegUnit RU1 : BC.MRI->regunits(Reg))
+              for (MCRegUnit RU2 : BC.MRI->regunits(E.Reg))
+                if (RU1 == RU2) RegMatch = true;
+            if (RegMatch && DUG.Nodes[E.Def].BBIndex != UseBBIdx)
+              IsCrossBBUse = true;
+            // Also check same-BB back-edge (def after use in same BB).
+            if (RegMatch && DUG.Nodes[E.Def].BBIndex == UseBBIdx &&
+                E.Def >= NID)
+              IsCrossBBUse = true; // Self-loop via back-edge.
+          }
+        }
+
+        if (IsCrossBBUse) {
+          DenseSet<unsigned> DefBBs;
+          if (InIt != DUG.InEdges.end()) {
+            for (unsigned EIdx : InIt->second) {
+              const DefUseEdge &E = DUG.Edges[EIdx];
+              bool RegMatch = false;
+              for (MCRegUnit RU1 : BC.MRI->regunits(Reg))
+                for (MCRegUnit RU2 : BC.MRI->regunits(E.Reg))
+                  if (RU1 == RU2) RegMatch = true;
+              if (RegMatch)
+                DefBBs.insert(DUG.Nodes[E.Def].BBIndex);
+            }
+          }
+          for (const BinaryBasicBlock *Pred :
+               AllBBs[UseBBIdx].BB->predecessors()) {
+            auto PIt = BBIdxMap.find(Pred);
+            if (PIt != BBIdxMap.end() && !DefBBs.count(PIt->second)) {
+              LiveIns.insert(Reg);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    MachineBasicBlock *EntryMBB = MBBs[0];
+    for (MCPhysReg Reg : LiveIns) {
+      const TargetRegisterClass *RC = safeGetRC(Reg);
+      if (!RC || !RC->isAllocatable()) {
+        // Non-allocatable live-ins (SP, NZCV, etc.) stay physical.
+        EntryMBB->addLiveIn(Reg);
+        continue;
+      }
+      Register VReg = MRI.createVirtualRegister(RC);
+      LiveInVReg[Reg] = VReg;
+      EntryMBB->addLiveIn(Reg);
+      BuildMI(*EntryMBB, EntryMBB->begin(), DebugLoc(),
+              TII->get(TargetOpcode::COPY), VReg)
+          .addReg(Reg);
+    }
+    EntryMBB->sortUniqueLiveIns();
+  }
+
+  // --- Helper: resolve a vreg for a use, inserting subreg conversions ---
+  // Given a (NID, UsePhysReg) pair, find the vreg from DefToVReg or
+  // LiveInVReg.  When the def's register differs in width from the use's
+  // register (e.g. W8 def → X8 use), insert SUBREG_TO_REG or EXTRACT_SUBREG.
+  //
+  // Insert a SUBREG_TO_REG or EXTRACT_SUBREG when a use expects a different
+  // register width than the def provides.  Returns the converted vreg.
+  auto resolveVReg = [&](MCPhysReg UseReg, Register SrcVReg,
+                         MCPhysReg DefPhysReg,
+                         const TargetRegisterClass *DstRC,
+                         MachineBasicBlock *InsertMBB,
+                         MachineBasicBlock::iterator InsertPt) -> Register {
+    if (UseReg == DefPhysReg)
+      return SrcVReg; // Same register, no conversion needed.
+
+    if (!DstRC || !DstRC->isAllocatable())
+      return SrcVReg;
+
+    // Check if DefPhysReg is a sub-register of UseReg (need widening).
+    unsigned SubIdx = TRI->getSubRegIndex(UseReg, DefPhysReg);
+    if (SubIdx) {
+      Register Wide = MRI.createVirtualRegister(DstRC);
+      BuildMI(*InsertMBB, InsertPt, DebugLoc(),
+              TII->get(TargetOpcode::SUBREG_TO_REG), Wide)
+          .addReg(SrcVReg)
+          .addImm(SubIdx);
+      return Wide;
+    }
+
+    // Check if UseReg is a sub-register of DefPhysReg (need narrowing).
+    SubIdx = TRI->getSubRegIndex(DefPhysReg, UseReg);
+    if (SubIdx) {
+      Register Narrow = MRI.createVirtualRegister(DstRC);
+      BuildMI(*InsertMBB, InsertPt, DebugLoc(),
+              TII->get(TargetOpcode::COPY), Narrow)
+          .addReg(SrcVReg, RegState{}, SubIdx);
+      return Narrow;
+    }
+
+    return SrcVReg;
+  };
+
+  // --- Helper: find the DefToVReg entry for a (DefNID, UseReg) pair,
+  // handling aliased registers. Returns {VReg, DefPhysReg} or {0, 0}. ---
+  auto findDefVReg = [&](NodeID DefNID, MCPhysReg UseReg)
+      -> std::pair<Register, MCPhysReg> {
+    // Direct match first.
+    auto VIt = DefToVReg.find({DefNID, UseReg});
+    if (VIt != DefToVReg.end())
+      return {VIt->second, UseReg};
+    // Try aliased registers.
+    for (MCPhysReg DefReg : DUG.Nodes[DefNID].Defs) {
+      bool Aliases = false;
+      for (MCRegUnit RU1 : BC.MRI->regunits(UseReg))
+        for (MCRegUnit RU2 : BC.MRI->regunits(DefReg))
+          if (RU1 == RU2)
+            Aliases = true;
+      if (Aliases) {
+        VIt = DefToVReg.find({DefNID, DefReg});
+        if (VIt != DefToVReg.end())
+          return {VIt->second, DefReg};
+      }
+    }
+    return {Register(), MCPhysReg(0)};
+  };
+
+  // --- Helper: find a live-in vreg for UseReg, handling aliases. ---
+  auto findLiveInVReg = [&](MCPhysReg UseReg)
+      -> std::pair<Register, MCPhysReg> {
+    auto It = LiveInVReg.find(UseReg);
+    if (It != LiveInVReg.end())
+      return {It->second, UseReg};
+    // Check aliases (e.g. X1 live-in but W1 used, or vice versa).
+    for (auto &[LIReg, LIVReg] : LiveInVReg) {
+      for (MCRegUnit RU1 : BC.MRI->regunits(UseReg))
+        for (MCRegUnit RU2 : BC.MRI->regunits(LIReg))
+          if (RU1 == RU2)
+            return {LIVReg, LIReg};
+    }
+    return {Register(), MCPhysReg(0)};
+  };
+
+  // --- Build reaching-definition map: for each (BBIdx, PhysReg alias group),
+  // record the last DefNID in that BB.  This allows us to find the definition
+  // that reaches the exit of any block. ---
+  // Key: (BBIdx, canonical PhysReg from DUG def) → last DefNID in that BB.
+  DenseMap<std::pair<unsigned, MCPhysReg>, NodeID> LastDefInBB;
+  for (unsigned NID = 0; NID < DUG.Nodes.size(); ++NID) {
+    const InstrNode &Node = DUG.Nodes[NID];
+    for (MCPhysReg Reg : Node.Defs) {
+      if (!DefToVReg.count({NID, Reg}))
+        continue; // Skip non-allocatable defs.
+      auto Key = std::make_pair(Node.BBIndex, Reg);
+      auto It = LastDefInBB.find(Key);
+      if (It == LastDefInBB.end() || NID > It->second)
+        LastDefInBB[Key] = NID;
+    }
+  }
+
+  // Helper: given a BBIdx and a UseReg, find the last def (NodeID) in that BB
+  // for any register that aliases UseReg.  Returns {DefNID, DefPhysReg} or
+  // {UINT_MAX, 0} if no def found.
+  auto findLastDefInBB = [&](unsigned BBIdx, MCPhysReg UseReg)
+      -> std::pair<NodeID, MCPhysReg> {
+    // Direct match first.
+    auto It = LastDefInBB.find({BBIdx, UseReg});
+    if (It != LastDefInBB.end())
+      return {It->second, UseReg};
+    // Try aliases.
+    NodeID BestNID = UINT_MAX;
+    MCPhysReg BestReg = 0;
+    for (auto &[Key, NID] : LastDefInBB) {
+      if (Key.first != BBIdx)
+        continue;
+      bool Aliases = false;
+      for (MCRegUnit RU1 : BC.MRI->regunits(UseReg))
+        for (MCRegUnit RU2 : BC.MRI->regunits(Key.second))
+          if (RU1 == RU2)
+            Aliases = true;
+      if (Aliases && (BestNID == UINT_MAX || NID > BestNID)) {
+        BestNID = NID;
+        BestReg = Key.second;
+      }
+    }
+    if (BestNID != UINT_MAX)
+      return {BestNID, BestReg};
+    return {UINT_MAX, MCPhysReg(0)};
+  };
+
+  // Helper: find the reaching definition for UseReg at the exit of PredBBIdx.
+  // Walks backwards through the CFG until a block with a def is found, or the
+  // entry block is reached (meaning the value comes from a function live-in).
+  // Returns {DefNID, DefPhysReg} where DefNID==UINT_MAX means live-in.
+  //
+  // IMPORTANT: This function must explore ALL paths, not just the first one.
+  // When multiple paths converge at a block, each predecessor path may have
+  // a different reaching def. If they differ, we return UINT_MAX-1 as a
+  // sentinel meaning "ambiguous — needs intermediate PHI".
+  static constexpr NodeID AmbiguousDef = UINT_MAX - 1;
+  auto findReachingDef = [&](unsigned PredBBIdx, MCPhysReg UseReg)
+      -> std::pair<NodeID, MCPhysReg> {
+    // First check if PredBBIdx itself has a def.
+    auto [DefNID, DefPhys] = findLastDefInBB(PredBBIdx, UseReg);
+    if (DefNID != UINT_MAX)
+      return {DefNID, DefPhys};
+
+    // BFS backwards. Track the reaching def found for each visited block.
+    // A block's reaching def is determined by its predecessors:
+    //   - If the block itself has a def, that's the reaching def.
+    //   - Otherwise, if all predecessors agree on the same reaching def,
+    //     that's the reaching def for this block.
+    //   - If predecessors disagree, this block needs a PHI (ambiguous).
+    DenseMap<unsigned, std::pair<NodeID, MCPhysReg>> ReachingAt;
+    SmallVector<unsigned, 8> Worklist;
+    DenseSet<unsigned> InWorklist;
+
+    // Start with PredBBIdx's predecessors.
+    for (const BinaryBasicBlock *Pred :
+         AllBBs[PredBBIdx].BB->predecessors()) {
+      auto PIt = BBIdxMap.find(Pred);
+      if (PIt == BBIdxMap.end())
+        continue;
+      unsigned PPIdx = PIt->second;
+      auto [DN, DP] = findLastDefInBB(PPIdx, UseReg);
+      if (DN != UINT_MAX) {
+        ReachingAt[PPIdx] = {DN, DP};
+      } else {
+        if (AllBBs[PPIdx].BB->pred_size() == 0) {
+          // Entry block with no def → live-in.
+          ReachingAt[PPIdx] = {UINT_MAX, MCPhysReg(0)};
+        } else {
+          Worklist.push_back(PPIdx);
+          InWorklist.insert(PPIdx);
+        }
+      }
+    }
+
+    // Process worklist: for each unresolved block, check its predecessors.
+    unsigned Iterations = 0;
+    while (!Worklist.empty() && Iterations < 1000) {
+      ++Iterations;
+      unsigned CurBBIdx = Worklist.pop_back_val();
+      InWorklist.erase(CurBBIdx);
+
+      // Check if all predecessors of CurBBIdx are resolved.
+      bool AllResolved = true;
+      NodeID UnifiedNID = UINT_MAX;
+      MCPhysReg UnifiedPhys = 0;
+      bool First = true;
+      bool Ambiguous = false;
+
+      for (const BinaryBasicBlock *PP :
+           AllBBs[CurBBIdx].BB->predecessors()) {
+        auto PPIt = BBIdxMap.find(PP);
+        if (PPIt == BBIdxMap.end())
+          continue;
+        unsigned PPIdx = PPIt->second;
+
+        // Check if PPIdx has a def itself.
+        auto [DN, DP] = findLastDefInBB(PPIdx, UseReg);
+        if (DN != UINT_MAX) {
+          ReachingAt[PPIdx] = {DN, DP};
+        }
+
+        auto RIt = ReachingAt.find(PPIdx);
+        if (RIt == ReachingAt.end()) {
+          // PPIdx not yet resolved.
+          if (AllBBs[PPIdx].BB->pred_size() == 0) {
+            ReachingAt[PPIdx] = {UINT_MAX, MCPhysReg(0)};
+          } else {
+            AllResolved = false;
+            if (!InWorklist.count(PPIdx)) {
+              Worklist.push_back(PPIdx);
+              InWorklist.insert(PPIdx);
+            }
+            continue;
+          }
+          RIt = ReachingAt.find(PPIdx);
+        }
+
+        if (First) {
+          UnifiedNID = RIt->second.first;
+          UnifiedPhys = RIt->second.second;
+          First = true; // Keep First=true until we find a second.
+          First = false;
+        } else if (RIt->second.first != UnifiedNID) {
+          Ambiguous = true;
+        }
+      }
+
+      if (AllResolved) {
+        if (Ambiguous)
+          ReachingAt[CurBBIdx] = {AmbiguousDef, MCPhysReg(0)};
+        else
+          ReachingAt[CurBBIdx] = {UnifiedNID, UnifiedPhys};
+      } else {
+        // Re-add to worklist if not all predecessors resolved.
+        if (!InWorklist.count(CurBBIdx)) {
+          Worklist.push_back(CurBBIdx);
+          InWorklist.insert(CurBBIdx);
+        }
+      }
+    }
+
+    // Now combine results from PredBBIdx's predecessors.
+    NodeID ResultNID = UINT_MAX;
+    MCPhysReg ResultPhys = 0;
+    bool ResultFirst = true;
+    for (const BinaryBasicBlock *Pred :
+         AllBBs[PredBBIdx].BB->predecessors()) {
+      auto PIt = BBIdxMap.find(Pred);
+      if (PIt == BBIdxMap.end())
+        continue;
+      auto RIt = ReachingAt.find(PIt->second);
+      if (RIt == ReachingAt.end()) {
+        // Couldn't resolve → treat as live-in.
+        if (ResultFirst) {
+          ResultNID = UINT_MAX;
+          ResultFirst = false;
+        } else if (ResultNID != UINT_MAX) {
+          return {AmbiguousDef, MCPhysReg(0)};
+        }
+        continue;
+      }
+      if (ResultFirst) {
+        ResultNID = RIt->second.first;
+        ResultPhys = RIt->second.second;
+        ResultFirst = false;
+      } else if (RIt->second.first != ResultNID) {
+        return {AmbiguousDef, MCPhysReg(0)};
+      }
+    }
+    return {ResultNID, ResultPhys};
+  };
+
+  // Build a map from (UseNodeID, PhysReg) → the VReg it should use.
+  // For intra-BB edges this is straightforward. For cross-BB edges where
+  // a use has defs from multiple predecessors, we need PHI nodes.
+  struct PhiCandidate {
+    NodeID UseNID;
+    MCPhysReg Reg;
+    unsigned UseBBIdx;
+  };
+
+  DenseMap<std::pair<NodeID, MCPhysReg>, Register> UseVReg;
+  std::vector<PhiCandidate> PhiCandidates;
+
+  for (unsigned NID = 0; NID < DUG.Nodes.size(); ++NID) {
+    const InstrNode &Node = DUG.Nodes[NID];
+    for (MCPhysReg Reg : Node.Uses) {
+      // Find all def-use edges feeding this (NID, Reg).
+      SmallVector<std::pair<NodeID, unsigned>, 2> Sources;
+      auto InIt = DUG.InEdges.find(NID);
+      if (InIt != DUG.InEdges.end()) {
+        for (unsigned EIdx : InIt->second) {
+          const DefUseEdge &E = DUG.Edges[EIdx];
+          bool Matches = false;
+          for (MCRegUnit RU1 : BC.MRI->regunits(Reg))
+            for (MCRegUnit RU2 : BC.MRI->regunits(E.Reg))
+              if (RU1 == RU2)
+                Matches = true;
+          if (Matches) {
+            unsigned DefBBIdx = DUG.Nodes[E.Def].BBIndex;
+            Sources.push_back({E.Def, DefBBIdx});
+          }
+        }
+      }
+
+      if (Sources.empty())
+        continue; // Function live-in — handled via LiveInVReg + resolveVReg.
+
+      unsigned UseBBIdx = Node.BBIndex;
+
+      // Single source in the same BB and not a back-edge → simple, no PHI.
+      if (Sources.size() == 1 && Sources[0].second == UseBBIdx &&
+          Sources[0].first < NID) {
+        auto [SrcVReg, DefPhysReg] = findDefVReg(Sources[0].first, Reg);
+        if (SrcVReg)
+          UseVReg[{NID, Reg}] = SrcVReg;
+        continue;
+      }
+
+      // If this is the entry block (no predecessors), just use the single def.
+      if (AllBBs[UseBBIdx].BB->pred_size() == 0) {
+        if (Sources.size() >= 1) {
+          auto [SrcVReg, DefPhysReg] = findDefVReg(Sources[0].first, Reg);
+          if (SrcVReg)
+            UseVReg[{NID, Reg}] = SrcVReg;
+        }
+        continue;
+      }
+
+      // For cross-BB uses or multi-source uses, use reaching-definition
+      // analysis to determine whether a PHI is needed.
+
+      // Collect the reaching def for each predecessor.
+      DenseMap<unsigned, std::pair<NodeID, MCPhysReg>> PredDefs;
+      bool AllSame = true;
+      NodeID FirstDefNID = UINT_MAX;
+      bool HasLiveIn = false;
+      bool FirstSet = false;
+
+      for (const BinaryBasicBlock *Pred :
+           AllBBs[UseBBIdx].BB->predecessors()) {
+        auto PIt = BBIdxMap.find(Pred);
+        if (PIt == BBIdxMap.end())
+          continue;
+        unsigned PredIdx = PIt->second;
+        auto [DN, DP] = findReachingDef(PredIdx, Reg);
+        PredDefs[PredIdx] = {DN, DP};
+
+        if (DN == UINT_MAX || DN == AmbiguousDef)
+          HasLiveIn = true;
+
+        if (!FirstSet) {
+          FirstDefNID = DN;
+          FirstSet = true;
+        } else if (DN != FirstDefNID) {
+          AllSame = false;
+        }
+      }
+
+      // If all predecessors agree on the same non-live-in def, no PHI needed.
+      if (AllSame && !HasLiveIn && FirstSet) {
+        auto [SrcVReg, DefPhysReg] = findDefVReg(FirstDefNID, Reg);
+        if (SrcVReg)
+          UseVReg[{NID, Reg}] = SrcVReg;
+        continue;
+      }
+
+      // Need a PHI.
+      PhiCandidates.push_back({NID, Reg, UseBBIdx});
+    }
+  }
+
+  // --- Determine the expected register class for a use operand ---
+  auto getUseRC = [&](const InstrNode &UseNode, MCPhysReg UseReg)
+      -> const TargetRegisterClass * {
+    if (BC.MIB->isPseudo(*UseNode.Inst))
+      return nullptr;
+    const MCInstrDesc &UseMCID = BC.MII->get(UseNode.Inst->getOpcode());
+    unsigned NumPrimeOps = MCPlus::getNumPrimeOperands(*UseNode.Inst);
+    // Skip def operands — only look at use operands for the register class.
+    for (unsigned I = UseMCID.getNumDefs(); I < NumPrimeOps; ++I) {
+      const MCOperand &MCOp = UseNode.Inst->getOperand(I);
+      if (!MCOp.isReg())
+        continue;
+      // Match by exact register or alias.
+      bool Match = (MCOp.getReg() == UseReg);
+      if (!Match) {
+        for (MCRegUnit RU1 : BC.MRI->regunits(UseReg))
+          for (MCRegUnit RU2 : BC.MRI->regunits(MCOp.getReg()))
+            if (RU1 == RU2)
+              Match = true;
+      }
+      if (Match && I < UseMCID.getNumOperands()) {
+        int16_t RCIdx = UseMCID.operands()[I].RegClass;
+        if (RCIdx >= 0)
+          return TRI->getRegClass(RCIdx);
+      }
+    }
+    return nullptr;
+  };
+
+  // Pre-allocate PHI vregs so UseVReg is populated during instruction emission.
+  // Actual PHI MachineInstrs are built after instruction emission so that
+  // predecessor defs exist for subreg conversion insertion.
+  struct PhiInfo {
+    Register PhiVReg;
+    const TargetRegisterClass *RC;
+    unsigned UseBBIdx;
+    MCPhysReg Reg;
+  };
+  std::vector<PhiInfo> Phis;
+  for (auto &Phi : PhiCandidates) {
+    const TargetRegisterClass *RC =
+        getUseRC(DUG.Nodes[Phi.UseNID], Phi.Reg);
+    if (!RC)
+      RC = safeGetRC(Phi.Reg);
+    if (!RC || !RC->isAllocatable())
+      continue;
+    Register PhiVReg = MRI.createVirtualRegister(RC);
+    UseVReg[{Phi.UseNID, Phi.Reg}] = PhiVReg;
+    Phis.push_back({PhiVReg, RC, Phi.UseBBIdx, Phi.Reg});
+  }
+
+  // --- Convert MCInst → MachineInstr ---
+  for (unsigned NID = 0; NID < DUG.Nodes.size(); ++NID) {
+    const InstrNode &Node = DUG.Nodes[NID];
+    const MCInst &Inst = *Node.Inst;
+    unsigned BBIdx = Node.BBIndex;
+    MachineBasicBlock *MBB = MBBs[BBIdx];
+
+    // Skip pseudo instructions (BOLT annotations like CFI).
+    if (BC.MIB->isPseudo(Inst))
+      continue;
+
+    unsigned Opcode = Inst.getOpcode();
+    const MCInstrDesc &MCID = BC.MII->get(Opcode);
+
+    // Build the MachineInstr.
+    auto MIB = BuildMI(*MBB, MBB->end(), DebugLoc(), MCID);
+    // Conversion instructions must be inserted before this instruction.
+    MachineBasicBlock::iterator ConvPt(MIB.getInstr());
+
+    // Get the expected register class for each use operand.
+    auto getOpRC = [&](unsigned OpIdx) -> const TargetRegisterClass * {
+      if (OpIdx < MCID.getNumOperands()) {
+        int16_t RCIdx = MCID.operands()[OpIdx].RegClass;
+        if (RCIdx >= 0)
+          return TRI->getRegClass(RCIdx);
+      }
+      return nullptr;
+    };
+
+    // Process explicit operands (skip BOLT annotation operands).
+    unsigned NumPrimeOps = MCPlus::getNumPrimeOperands(Inst);
+    for (unsigned I = 0; I < NumPrimeOps; ++I) {
+      const MCOperand &MCOp = Inst.getOperand(I);
+
+      if (MCOp.isReg()) {
+        MCPhysReg PReg = MCOp.getReg();
+        bool IsDef = (I < MCID.getNumDefs());
+
+        if (PReg == 0) {
+          MIB.addReg(0, IsDef ? RegState::Define : RegState{});
+          continue;
+        }
+
+        if (IsDef) {
+          auto VIt = DefToVReg.find({NID, PReg});
+          if (VIt != DefToVReg.end())
+            MIB.addDef(VIt->second);
+          else
+            MIB.addDef(PReg);
+        } else {
+          // Try UseVReg (from def-use graph or PHI).
+          auto VIt = UseVReg.find({NID, PReg});
+          if (VIt != UseVReg.end()) {
+            Register Resolved = VIt->second;
+            // Check if subreg conversion is needed.
+            // If the resolved vreg came from a PHI, do conversion from the
+            // PHI vreg (not the raw def) to avoid cross-block references.
+            bool IsPhi = false;
+            for (auto &PI : Phis) {
+              if (PI.PhiVReg == Resolved) {
+                IsPhi = true;
+                break;
+              }
+            }
+
+            if (!IsPhi) {
+              // Direct def (not through PHI) — use the original def for
+              // subreg conversion.
+              auto InIt = DUG.InEdges.find(NID);
+              if (InIt != DUG.InEdges.end()) {
+                for (unsigned EIdx : InIt->second) {
+                  const DefUseEdge &E = DUG.Edges[EIdx];
+                  bool Match = false;
+                  for (MCRegUnit RU1 : BC.MRI->regunits(PReg))
+                    for (MCRegUnit RU2 : BC.MRI->regunits(E.Reg))
+                      if (RU1 == RU2) Match = true;
+                  if (Match) {
+                    auto [DefVReg, DefPhys] = findDefVReg(E.Def, PReg);
+                    if (DefVReg && DefPhys != PReg) {
+                      const TargetRegisterClass *UseRC = getOpRC(I);
+                      if (!UseRC)
+                        UseRC = safeGetRC(PReg);
+                      Resolved = resolveVReg(PReg, DefVReg, DefPhys,
+                                             UseRC, MBB, ConvPt);
+                    }
+                    break;
+                  }
+                }
+              }
+            }
+            // else: PHI vreg — conversion was already done in the
+            // predecessor blocks during PHI building.
+            // Ensure the vreg's register class is compatible with what the
+            // instruction operand expects. If not, COPY to a new vreg with
+            // the right class (e.g., gpr32 → gpr32sp for SUBSWri).
+            if (Resolved.isVirtual()) {
+              const TargetRegisterClass *ExpRC = getOpRC(I);
+              if (ExpRC) {
+                const TargetRegisterClass *CurRC = MRI.getRegClass(Resolved);
+                if (CurRC != ExpRC && !ExpRC->hasSubClassEq(CurRC)) {
+                  Register Fixed = MRI.createVirtualRegister(ExpRC);
+                  BuildMI(*MBB, ConvPt, DebugLoc(),
+                          TII->get(TargetOpcode::COPY), Fixed)
+                      .addReg(Resolved);
+                  Resolved = Fixed;
+                }
+              }
+            }
+            MIB.addUse(Resolved);
+          } else {
+            // Try live-in vreg (function arguments, callee-saved regs).
+            auto [LIVReg, LIPhys] = findLiveInVReg(PReg);
+            if (LIVReg) {
+              Register Resolved = LIVReg;
+              if (LIPhys != PReg) {
+                const TargetRegisterClass *UseRC = getOpRC(I);
+                if (!UseRC)
+                  UseRC = safeGetRC(PReg);
+                Resolved = resolveVReg(PReg, LIVReg, LIPhys,
+                                       UseRC, MBB, ConvPt);
+              }
+              MIB.addUse(Resolved);
+            } else {
+              // No UseVReg or LiveInVReg found. If the register is allocatable,
+              // lazily create a live-in COPY to avoid undefined phys reg errors.
+              const TargetRegisterClass *RC = safeGetRC(PReg);
+              if (RC && RC->isAllocatable()) {
+                MachineBasicBlock *EntryMBB = MBBs[0];
+                Register NewVReg = MRI.createVirtualRegister(RC);
+                LiveInVReg[PReg] = NewVReg;
+                EntryMBB->addLiveIn(PReg);
+                BuildMI(*EntryMBB, EntryMBB->begin(), DebugLoc(),
+                        TII->get(TargetOpcode::COPY), NewVReg)
+                    .addReg(PReg);
+                EntryMBB->sortUniqueLiveIns();
+                Register Resolved = NewVReg;
+                const TargetRegisterClass *UseRC = getOpRC(I);
+                if (UseRC && UseRC != RC && !UseRC->hasSubClassEq(RC)) {
+                  Register Fixed = MRI.createVirtualRegister(UseRC);
+                  BuildMI(*MBB, ConvPt, DebugLoc(),
+                          TII->get(TargetOpcode::COPY), Fixed)
+                      .addReg(NewVReg);
+                  Resolved = Fixed;
+                }
+                MIB.addUse(Resolved);
+              } else {
+                MIB.addUse(PReg); // Truly physical (SP, NZCV, etc.).
+              }
+            }
+          }
+        }
+      } else if (MCOp.isImm()) {
+        MIB.addImm(MCOp.getImm());
+      } else if (MCOp.isExpr()) {
+        bool Resolved = false;
+        if (MCOp.getExpr()->getKind() == MCExpr::SymbolRef) {
+          const MCSymbolRefExpr *SRE =
+              cast<MCSymbolRefExpr>(MCOp.getExpr());
+          const MCSymbol &Sym = SRE->getSymbol();
+          for (unsigned J = 0; J < AllBBs.size(); ++J) {
+            if (AllBBs[J].BB->getLabel() == &Sym) {
+              MIB.addMBB(MBBs[J]);
+              Resolved = true;
+              break;
+            }
+          }
+          if (!Resolved) {
+            // External symbol on a branch/terminator would crash the verifier
+            // (isMBB assertion). For tail calls to external functions, skip
+            // the symbol operand and let the branch target be left empty.
+            // For non-branch instructions, use addExternalSymbol normally.
+            if (MCID.isTerminator() || MCID.isBranch()) {
+              // Create a dummy exit MBB for tail-call branches.
+              MachineBasicBlock *ExitMBB = MF.CreateMachineBasicBlock();
+              MF.push_back(ExitMBB);
+              MBB->addSuccessor(ExitMBB);
+              MIB.addMBB(ExitMBB);
+            } else {
+              MIB.addExternalSymbol(Sym.getName().data());
+            }
+            Resolved = true;
+          }
+        }
+        if (!Resolved)
+          MIB.addImm(0);
+      } else if (MCOp.isSFPImm()) {
+        MIB.addImm(bit_cast<int32_t>(MCOp.getSFPImm()));
+      } else if (MCOp.isDFPImm()) {
+        MIB.addImm(bit_cast<int64_t>(MCOp.getDFPImm()));
+      }
+    }
+  }
+
+  // --- Build PHI MachineInstrs (after all defs are emitted) ---
+  // For each PHI, iterate over CFG predecessors and use findReachingDef to
+  // determine the definition that reaches each predecessor's exit.
+  for (auto &PI : Phis) {
+    MachineBasicBlock *UseMBB = MBBs[PI.UseBBIdx];
+    MachineInstrBuilder PhiMIB =
+        BuildMI(*UseMBB, UseMBB->begin(), DebugLoc(),
+                TII->get(TargetOpcode::PHI), PI.PhiVReg);
+
+    for (const BinaryBasicBlock *Pred :
+         AllBBs[PI.UseBBIdx].BB->predecessors()) {
+      auto PIt = BBIdxMap.find(Pred);
+      if (PIt == BBIdxMap.end())
+        continue;
+      unsigned PredIdx = PIt->second;
+      MachineBasicBlock *PredMBB = MBBs[PredIdx];
+
+      auto [DefNID, DefPhys] = findReachingDef(PredIdx, PI.Reg);
+
+      Register SrcVReg;
+      MCPhysReg DefPhysReg = 0;
+      if (DefNID == UINT_MAX || DefNID == AmbiguousDef) {
+        // Function live-in (or ambiguous merge — fall back to live-in).
+        auto [LIV, LIP] = findLiveInVReg(PI.Reg);
+        SrcVReg = LIV;
+        DefPhysReg = LIP;
+        // If no live-in vreg exists yet, create one lazily.
+        if (!SrcVReg) {
+          const TargetRegisterClass *RC = safeGetRC(PI.Reg);
+          if (RC && RC->isAllocatable()) {
+            MachineBasicBlock *EntryMBB = MBBs[0];
+            Register NewVReg = MRI.createVirtualRegister(RC);
+            LiveInVReg[PI.Reg] = NewVReg;
+            EntryMBB->addLiveIn(PI.Reg);
+            BuildMI(*EntryMBB, EntryMBB->begin(), DebugLoc(),
+                    TII->get(TargetOpcode::COPY), NewVReg)
+                .addReg(PI.Reg);
+            EntryMBB->sortUniqueLiveIns();
+            SrcVReg = NewVReg;
+            DefPhysReg = PI.Reg;
+          }
+        }
+      } else {
+        std::tie(SrcVReg, DefPhysReg) = findDefVReg(DefNID, PI.Reg);
+      }
+      if (!SrcVReg)
+        continue;
+      if (DefPhysReg && DefPhysReg != PI.Reg) {
+        auto InsertPt = PredMBB->getFirstTerminator();
+        SrcVReg = resolveVReg(PI.Reg, SrcVReg, DefPhysReg,
+                              PI.RC, PredMBB, InsertPt);
+      }
+      // Ensure register class compatibility.
+      if (SrcVReg.isVirtual()) {
+        const TargetRegisterClass *CurRC = MRI.getRegClass(SrcVReg);
+        if (CurRC != PI.RC && !PI.RC->hasSubClassEq(CurRC)) {
+          Register Fixed = MRI.createVirtualRegister(PI.RC);
+          auto InsertPt = PredMBB->getFirstTerminator();
+          BuildMI(*PredMBB, InsertPt, DebugLoc(),
+                  TII->get(TargetOpcode::COPY), Fixed)
+              .addReg(SrcVReg);
+          SrcVReg = Fixed;
+        }
+      }
+      PhiMIB.addReg(SrcVReg).addMBB(PredMBB);
+    }
+  }
+
+  // --- Add physical register live-ins to non-entry blocks ---
+  // The verifier requires that any physical register used in a block must
+  // be either defined in the block or in the block's live-in list.
+  // Scan each block for physical register uses and add missing live-ins.
+  for (auto &MBB : MF) {
+    DenseSet<MCPhysReg> PhysDefs;
+    DenseSet<MCPhysReg> PhysUses;
+
+    for (const MachineInstr &MI : MBB) {
+      // Process uses BEFORE defs — a use on the same instruction as a def
+      // reads the value from before the instruction (e.g., CCMPWr reads
+      // NZCV and then writes NZCV).
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg() || !MO.getReg().isPhysical() || MO.getReg() == 0)
+          continue;
+        if (MO.isUse() && !PhysDefs.count(MO.getReg()))
+          PhysUses.insert(MO.getReg());
+      }
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg() || !MO.getReg().isPhysical() || MO.getReg() == 0)
+          continue;
+        if (MO.isDef())
+          PhysDefs.insert(MO.getReg());
+      }
+    }
+
+    for (MCPhysReg PReg : PhysUses) {
+      if (!MBB.isLiveIn(PReg))
+        MBB.addLiveIn(PReg);
+    }
+    MBB.sortUniqueLiveIns();
+  }
+
+  // Write the .mir file.
+  std::string Filename = sanitizeFilename(FuncName) + ".mir";
+  std::filesystem::path OutPath =
+      std::filesystem::path(OutDir) / Filename;
+  std::error_code EC;
+  raw_fd_ostream OS(OutPath.string(), EC);
+  if (EC) {
+    errs() << ToolName << ": cannot open '" << OutPath.string()
+           << "': " << EC.message() << "\n";
+    MMI.deleteMachineFunctionFor(*IRFunc);
+    IRFunc->eraseFromParent();
+    return false;
+  }
+
+  printMIR(OS, IRMod);
+  printMIR(OS, MMI, MF);
+
+  // Clean up the MachineFunction so the next function can reuse the module.
+  MMI.deleteMachineFunctionFor(*IRFunc);
+  IRFunc->eraseFromParent();
+
+  return true;
+}
+
+/// Extract all functions from a BinaryContext as .mir files.
+static void processExtract(const BinaryContext &BC,
+                           const std::string &OutDir) {
+  // Create output directory if it doesn't exist.
+  std::error_code EC = sys::fs::create_directories(OutDir);
+  if (EC) {
+    errs() << ToolName << ": cannot create directory '" << OutDir
+           << "': " << EC.message() << "\n";
+    return;
+  }
+
+  // Construct a normalized triple. BOLT's TheTriple may have empty vendor/OS
+  // fields (e.g., "aarch64---macho"). Fill them in for readable MIR output.
+  Triple NormalizedTriple(*BC.TheTriple);
+  if (NormalizedTriple.getVendor() == Triple::UnknownVendor &&
+      NormalizedTriple.getOS() == Triple::UnknownOS &&
+      NormalizedTriple.isOSBinFormatMachO()) {
+    NormalizedTriple.setVendor(Triple::Apple);
+    NormalizedTriple.setOS(Triple::Darwin);
+  }
+
+  // Optional regex filter.
+  std::unique_ptr<Regex> Filter;
+  if (opts::ExtractFilter.getNumOccurrences()) {
+    std::string Err;
+    Filter = std::make_unique<Regex>(opts::ExtractFilter);
+    if (!Filter->isValid(Err)) {
+      errs() << ToolName << ": invalid filter regex '"
+             << opts::ExtractFilter << "': " << Err << "\n";
+      return;
+    }
+  }
+
+  // Collect functions to extract.
+  SmallVector<const BinaryFunction *, 0> Functions;
+  unsigned Skipped = 0;
+  for (const auto &[Addr, BF] : BC.getBinaryFunctions()) {
+    if (Filter && !Filter->match(BF.getPrintName())) {
+      ++Skipped;
+      continue;
+    }
+    Functions.push_back(&BF);
+  }
+
+  // Determine thread count.
+  unsigned NumThreads = opts::ThreadCount;
+  if (NumThreads == 0)
+    NumThreads = std::thread::hardware_concurrency();
+  if (NumThreads == 0)
+    NumThreads = 1;
+  // Don't use more threads than functions.
+  NumThreads = std::min(NumThreads, (unsigned)Functions.size());
+
+  std::atomic<unsigned> Count{0};
+  std::atomic<unsigned> ExtractSkipped{0};
+
+  if (NumThreads <= 1) {
+    // Single-threaded path — no overhead.
+    std::unique_ptr<TargetMachine> TM(BC.TheTarget->createTargetMachine(
+        *BC.TheTriple, "", "", TargetOptions(), std::nullopt));
+    if (!TM) {
+      errs() << ToolName << ": failed to create TargetMachine\n";
+      return;
+    }
+    LLVMContext Ctx;
+    Module IRMod("llvm-match-extract", Ctx);
+    IRMod.setTargetTriple(NormalizedTriple);
+    IRMod.setDataLayout(TM->createDataLayout());
+    MachineModuleInfo MMI(TM.get());
+
+    for (const BinaryFunction *BF : Functions) {
+      if (extractFunctionToMIR(BC, *BF, *TM, MMI, IRMod, OutDir))
+        ++Count;
+      else
+        ++ExtractSkipped;
+    }
+  } else {
+    // Multi-threaded path.
+    // Each worker thread gets its own {TargetMachine, LLVMContext, Module, MMI}
+    // stored in a thread-local-like structure. Individual functions are submitted
+    // as tasks so the pool naturally load-balances (work-stealing).
+    struct ThreadState {
+      std::unique_ptr<TargetMachine> TM;
+      std::unique_ptr<LLVMContext> Ctx;
+      std::unique_ptr<Module> IRMod;
+      std::unique_ptr<MachineModuleInfo> MMI;
+    };
+    std::mutex StateMtx;
+    DenseMap<uint64_t, std::unique_ptr<ThreadState>> States;
+
+    auto getState = [&]() -> ThreadState & {
+      uint64_t TID = llvm::get_threadid();
+      std::lock_guard<std::mutex> Lock(StateMtx);
+      auto &Ptr = States[TID];
+      if (!Ptr) {
+        Ptr = std::make_unique<ThreadState>();
+        Ptr->TM.reset(BC.TheTarget->createTargetMachine(
+            *BC.TheTriple, "", "", TargetOptions(), std::nullopt));
+        Ptr->Ctx = std::make_unique<LLVMContext>();
+        Ptr->IRMod =
+            std::make_unique<Module>("llvm-match-extract", *Ptr->Ctx);
+        Ptr->IRMod->setTargetTriple(NormalizedTriple);
+        Ptr->IRMod->setDataLayout(Ptr->TM->createDataLayout());
+        Ptr->MMI = std::make_unique<MachineModuleInfo>(Ptr->TM.get());
+      }
+      return *Ptr;
+    };
+
+    StdThreadPool Pool(hardware_concurrency(NumThreads));
+    for (const BinaryFunction *BF : Functions) {
+      Pool.async([&, BF]() {
+        auto &S = getState();
+        if (extractFunctionToMIR(BC, *BF, *S.TM, *S.MMI, *S.IRMod, OutDir))
+          Count.fetch_add(1, std::memory_order_relaxed);
+        else
+          ExtractSkipped.fetch_add(1, std::memory_order_relaxed);
+      });
+    }
+    Pool.wait();
+  }
+
+  Skipped += ExtractSkipped.load();
+  outs() << "Extracted " << Count.load() << " function(s) to " << OutDir;
+  if (Skipped)
+    outs() << " (" << Skipped << " skipped)";
+  outs() << "\n";
+}
+
+// ===----------------------------------------------------------------------===//
 // Binary loading (reused from previous implementation)
 // ===----------------------------------------------------------------------===//
 
@@ -3323,6 +4681,9 @@ static void processBinaryContext(const BinaryContext &BC,
 
   if (opts::DumpGraph.getNumOccurrences())
     dumpGraphs(BC, opts::DumpGraph);
+
+  if (opts::DumpSvg.getNumOccurrences())
+    dumpSvgGraphs(BC, opts::DumpSvg);
 
   if (!Pattern.empty())
     runMatcher(BC, Pattern);
@@ -3351,6 +4712,7 @@ static void clearProgress() {
 }
 
 static void processMachO(MachOObjectFile *MachOObj, StringRef ToolPath,
+                          bool IsExtract,
                           const std::vector<PatternLine> &Pattern,
                           const std::vector<NamedPattern> &Suite) {
   auto MachORIOrErr = MachORewriteInstance::create(MachOObj, ToolPath);
@@ -3366,7 +4728,9 @@ static void processMachO(MachOObjectFile *MachOObj, StringRef ToolPath,
   if (errs().is_displayed())
     fprintf(stderr, "Loaded %zu functions\n",
             MachORI.getBinaryContext().getBinaryFunctions().size());
-  {
+  if (IsExtract) {
+    processExtract(MachORI.getBinaryContext(), opts::OutDir);
+  } else {
     TimeRegion TR(opts::TimeOpt ? &TMatch : nullptr);
     processBinaryContext(MachORI.getBinaryContext(), Pattern, Suite);
   }
@@ -3399,9 +4763,11 @@ int main(int argc, char **argv) {
   // attempting to rewrite the binary.
   opts::BinaryAnalysisMode = true;
 
-  // Parse pattern file if provided.
+  bool IsExtract = static_cast<bool>(opts::ExtractCmd);
+
+  // Parse pattern file if provided (skip for extract subcommand).
   std::vector<PatternLine> Pattern;
-  if (!opts::PatternFilename.empty()) {
+  if (!IsExtract && !opts::PatternFilename.empty()) {
     auto BufOrErr = MemoryBuffer::getFile(opts::PatternFilename);
     if (!BufOrErr)
       report_error(opts::PatternFilename, BufOrErr.getError());
@@ -3424,9 +4790,9 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Parse suite file if provided.
+  // Parse suite file if provided (skip for extract subcommand).
   std::vector<NamedPattern> Suite;
-  if (!opts::SuiteFilename.empty()) {
+  if (!IsExtract && !opts::SuiteFilename.empty()) {
     auto BufOrErr = MemoryBuffer::getFile(opts::SuiteFilename);
     if (!BufOrErr)
       report_error(opts::SuiteFilename, BufOrErr.getError());
@@ -3442,9 +4808,11 @@ int main(int argc, char **argv) {
     outs() << "\n";
   }
 
-  // If no action specified, default to dump-functions.
-  if (!opts::DumpFunctions && !opts::DumpLiveness && Pattern.empty() &&
-      Suite.empty() && !opts::DumpGraph.getNumOccurrences())
+  // If no action specified (and not extract mode), default to dump-functions.
+  if (!IsExtract && !opts::DumpFunctions && !opts::DumpLiveness &&
+      Pattern.empty() && Suite.empty() &&
+      !opts::DumpGraph.getNumOccurrences() &&
+      !opts::DumpSvg.getNumOccurrences())
     opts::DumpFunctions = true;
 
   if (!sys::fs::exists(opts::InputFilename))
@@ -3471,12 +4839,14 @@ int main(int argc, char **argv) {
     if (errs().is_displayed())
       fprintf(stderr, "Loaded %zu functions\n",
               RI.getBinaryContext().getBinaryFunctions().size());
-    {
+    if (IsExtract) {
+      processExtract(RI.getBinaryContext(), opts::OutDir);
+    } else {
       TimeRegion TR(opts::TimeOpt ? &TMatch : nullptr);
       processBinaryContext(RI.getBinaryContext(), Pattern, Suite);
     }
   } else if (auto *MachOObj = dyn_cast<MachOObjectFile>(&Binary)) {
-    processMachO(MachOObj, ToolPath, Pattern, Suite);
+    processMachO(MachOObj, ToolPath, IsExtract, Pattern, Suite);
   } else if (auto *FatBin = dyn_cast<MachOUniversalBinary>(&Binary)) {
     StringRef Arch = opts::ArchName;
     if (Arch.empty()) {
@@ -3490,7 +4860,7 @@ int main(int argc, char **argv) {
     auto ObjOrErr = FatBin->getMachOObjectForArch(Arch);
     if (Error E = ObjOrErr.takeError())
       report_error(opts::InputFilename, std::move(E));
-    processMachO(ObjOrErr->get(), ToolPath, Pattern, Suite);
+    processMachO(ObjOrErr->get(), ToolPath, IsExtract, Pattern, Suite);
   } else {
     report_error(opts::InputFilename, object_error::invalid_file_type);
   }
