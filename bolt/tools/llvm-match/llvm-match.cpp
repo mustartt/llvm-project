@@ -19,6 +19,7 @@
 #include "bolt/Rewrite/MachORewriteInstance.h"
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "bolt/Utils/CommandLineOpts.h"
+#include "FilterExpr.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/DenseMap.h"
@@ -70,7 +71,9 @@ namespace opts {
 
 static cl::OptionCategory MatchCategory("llvm-match options");
 
-// --- extract subcommand ---
+// --- subcommands ---
+static cl::SubCommand MatchCmd("match",
+    "Match instruction patterns across binary functions");
 static cl::SubCommand ExtractCmd("extract",
     "Extract functions as MIR files in Machine SSA form");
 
@@ -78,56 +81,66 @@ static cl::opt<std::string> InputFilename(cl::Positional,
                                           cl::desc("<executable>"),
                                           cl::Required,
                                           cl::cat(MatchCategory),
-                                          cl::sub(cl::SubCommand::getTopLevel()),
+                                          cl::sub(MatchCmd),
                                           cl::sub(ExtractCmd));
 
 static cl::opt<std::string>
     ArchName("arch", cl::desc("architecture slice for universal binaries"),
              cl::Optional, cl::cat(MatchCategory),
-             cl::sub(cl::SubCommand::getTopLevel()),
+             cl::sub(MatchCmd),
              cl::sub(ExtractCmd));
 
 static cl::opt<std::string>
     PatternFilename("pattern", cl::desc("pattern file for matching"),
-                    cl::Optional, cl::cat(MatchCategory));
+                    cl::Optional, cl::cat(MatchCategory),
+                    cl::sub(MatchCmd));
 
 static cl::opt<std::string>
     SuiteFilename("suite", cl::desc("YAML suite file with multiple patterns"),
-                  cl::Optional, cl::cat(MatchCategory));
+                  cl::Optional, cl::cat(MatchCategory),
+                  cl::sub(MatchCmd));
 
 static cl::opt<bool>
     DumpLiveness("dump-liveness", cl::desc("dump live-in/live-out per BB"),
-                 cl::Optional, cl::cat(MatchCategory));
+                 cl::Optional, cl::cat(MatchCategory),
+                 cl::sub(MatchCmd));
 
 static cl::opt<bool>
     DumpFunctions("dump-functions", cl::desc("dump disassembled functions"),
-                  cl::Optional, cl::cat(MatchCategory));
+                  cl::Optional, cl::cat(MatchCategory),
+                  cl::sub(MatchCmd));
 
 static cl::opt<unsigned>
     ThreadCount("j", cl::desc("number of threads (0 = hardware concurrency)"),
-                cl::init(0), cl::Optional, cl::cat(MatchCategory));
+                cl::init(0), cl::Optional, cl::cat(MatchCategory),
+                cl::sub(MatchCmd),
+                cl::sub(ExtractCmd));
 
 static cl::opt<bool>
     DumpPattern("dump-pattern", cl::desc("print parsed pattern as a graph"),
-                cl::Optional, cl::cat(MatchCategory));
+                cl::Optional, cl::cat(MatchCategory),
+                cl::sub(MatchCmd));
 
 static cl::opt<std::string>
     DumpPatternDot("dump-pattern-dot",
                    cl::desc("emit pattern graph as Graphviz DOT to file"),
                    cl::value_desc("filename"),
-                   cl::Optional, cl::cat(MatchCategory));
+                   cl::Optional, cl::cat(MatchCategory),
+                   cl::sub(MatchCmd));
 
 static cl::opt<std::string>
     DumpGraph("dump-graph",
               cl::desc("emit def-use graph as DOT for functions matching regex"),
               cl::value_desc("regex"),
-              cl::Optional, cl::cat(MatchCategory));
+              cl::Optional, cl::cat(MatchCategory),
+              cl::sub(MatchCmd));
 
 static cl::opt<std::string>
     DumpSvg("dump-svg",
             cl::desc("emit CFG as SVG for functions matching regex (uses Triskel SESE layout)"),
             cl::value_desc("regex"),
-            cl::Optional, cl::cat(MatchCategory));
+            cl::Optional, cl::cat(MatchCategory),
+            cl::sub(MatchCmd));
 
 enum OutputMode { OM_Count, OM_Summary, OM_Detailed };
 static cl::opt<OutputMode> OutputLevel(
@@ -136,11 +149,19 @@ static cl::opt<OutputMode> OutputLevel(
                           "show per-function hit counts sorted by frequency"),
                clEnumValN(OM_Detailed, "detailed",
                           "show every individual match (verbose)")),
-    cl::init(OM_Count), cl::cat(MatchCategory));
+    cl::init(OM_Count), cl::cat(MatchCategory),
+    cl::sub(MatchCmd));
 
 static cl::opt<bool>
     TimeOpt("time", cl::desc("print timing breakdown"),
-            cl::Optional, cl::cat(MatchCategory));
+            cl::Optional, cl::cat(MatchCategory),
+            cl::sub(MatchCmd));
+
+static cl::opt<unsigned>
+    ContextLines("context",
+                 cl::desc("show N instructions of context around each match"),
+                 cl::value_desc("N"), cl::init(0), cl::Optional,
+                 cl::cat(MatchCategory), cl::sub(MatchCmd));
 
 static cl::opt<std::string>
     OutDir("out-dir",
@@ -336,10 +357,73 @@ static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs,
     PerBBLastDef[BBIdx] = std::move(LastDef);
   }
 
-  // Step 3: Cross-BB edges.
+  // Step 3: Cross-BB edges via reaching definitions.
+  // For each live-in use in a BB, walk backward through the CFG to find the
+  // reaching definition.  This handles cases where a value flows through
+  // intermediate blocks that don't redefine the register (e.g., BB0 defines x8,
+  // BB1 passes it through, BB2 uses it).  For loops, we also get back-edge
+  // connections (a BB can be its own predecessor).
   DenseMap<const BinaryBasicBlock *, unsigned> BBPtrToIdx;
   for (unsigned I = 0; I < AllBBs.size(); ++I)
     BBPtrToIdx[AllBBs[I].BB] = I;
+
+  // Precompute which regunits are killed (redefined) in each BB.
+  // A regunit is killed if any instruction in the BB defines a register that
+  // covers it, OR if the BB contains a call (which clobbers caller-saved).
+  std::vector<DenseSet<unsigned>> BBKilledRUs(AllBBs.size());
+  for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
+    unsigned Start = G.BBStart[BBIdx];
+    unsigned End = (BBIdx + 1 < AllBBs.size()) ? G.BBStart[BBIdx + 1]
+                                                : G.Nodes.size();
+    for (unsigned NID = Start; NID < End; ++NID) {
+      const InstrNode &Node = G.Nodes[NID];
+      for (MCPhysReg Reg : Node.Defs)
+        for (MCRegUnit RU : MRI.regunits(Reg))
+          BBKilledRUs[BBIdx].insert(static_cast<unsigned>(RU));
+      if (BC.MIB->isCall(*Node.Inst)) {
+        for (unsigned RU = 0, E = MRI.getNumRegUnits(); RU < E; ++RU)
+          if (!CalleeSavedRUs.count(RU))
+            BBKilledRUs[BBIdx].insert(RU);
+      }
+    }
+  }
+
+  // findReachingDefs: for a given regunit, walk backward from a BB through
+  // its predecessors, collecting all NodeIDs that are the last def of that
+  // regunit.  Stops at BBs that define (kill) the regunit, or at visited BBs.
+  auto findReachingDefs = [&](unsigned StartBBIdx, unsigned RU,
+                              SmallVectorImpl<NodeID> &Defs) {
+    SmallVector<unsigned, 8> Worklist;
+    DenseSet<unsigned> Visited;
+
+    // Seed with direct predecessors.
+    for (const BinaryBasicBlock *Pred : AllBBs[StartBBIdx].BB->predecessors()) {
+      auto PredIt = BBPtrToIdx.find(Pred);
+      if (PredIt != BBPtrToIdx.end())
+        Worklist.push_back(PredIt->second);
+    }
+
+    while (!Worklist.empty()) {
+      unsigned BBIdx = Worklist.pop_back_val();
+      if (!Visited.insert(BBIdx).second)
+        continue;
+
+      auto DefIt = PerBBLastDef[BBIdx].find(RU);
+      if (DefIt != PerBBLastDef[BBIdx].end()) {
+        // This BB defines the regunit — record the defining node.
+        Defs.push_back(DefIt->second);
+        // Don't continue past this BB (the def blocks further search).
+      } else {
+        // This BB doesn't define the regunit — continue through its preds.
+        for (const BinaryBasicBlock *Pred :
+             AllBBs[BBIdx].BB->predecessors()) {
+          auto PredIt = BBPtrToIdx.find(Pred);
+          if (PredIt != BBPtrToIdx.end())
+            Worklist.push_back(PredIt->second);
+        }
+      }
+    }
+  };
 
   for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
     unsigned Start = G.BBStart[BBIdx];
@@ -366,8 +450,6 @@ static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs,
       for (MCPhysReg Reg : Node.Defs)
         for (MCRegUnit RU : MRI.regunits(Reg))
           DefinedSoFar.insert(static_cast<unsigned>(RU));
-      // Calls clobber caller-saved regunits — mark them as defined so that
-      // later uses in this BB don't appear as live-in.
       if (BC.MIB->isCall(*Node.Inst)) {
         for (unsigned RU = 0, E = MRI.getNumRegUnits(); RU < E; ++RU) {
           if (!CalleeSavedRUs.count(RU))
@@ -376,23 +458,23 @@ static DefUseGraph buildDefUseGraph(const std::vector<BBInfo> &AllBBs,
       }
     }
 
-    // For each live-in use, find definer in predecessor BBs via regunits.
+    // For each live-in use, find all reaching definitions via CFG walk.
+    DenseSet<std::pair<NodeID, NodeID>> SeenEdges;
     for (const auto &[Reg, UseNID] : LiveInUses) {
-      for (const BinaryBasicBlock *Pred : AllBBs[BBIdx].BB->predecessors()) {
-        auto PredIt = BBPtrToIdx.find(Pred);
-        if (PredIt == BBPtrToIdx.end())
-          continue;
-        unsigned PredIdx = PredIt->second;
-        for (MCRegUnit RU : MRI.regunits(Reg)) {
-          auto DefIt = PerBBLastDef[PredIdx].find(static_cast<unsigned>(RU));
-          if (DefIt != PerBBLastDef[PredIdx].end()) {
-            unsigned EIdx = G.Edges.size();
-            G.Edges.push_back({DefIt->second, UseNID, Reg});
-            G.OutEdges[DefIt->second].push_back(EIdx);
-            G.InEdges[UseNID].push_back(EIdx);
-            break; // One edge per (pred, use) pair is enough.
-          }
+      for (MCRegUnit RU : MRI.regunits(Reg)) {
+        SmallVector<NodeID, 4> ReachingDefs;
+        findReachingDefs(BBIdx, static_cast<unsigned>(RU), ReachingDefs);
+        for (NodeID DefNID : ReachingDefs) {
+          if (!SeenEdges.insert({DefNID, UseNID}).second)
+            continue;
+          unsigned EIdx = G.Edges.size();
+          G.Edges.push_back({DefNID, UseNID, Reg});
+          G.OutEdges[DefNID].push_back(EIdx);
+          G.InEdges[UseNID].push_back(EIdx);
         }
+        // Only process the first regunit that has reaching defs.
+        if (!ReachingDefs.empty())
+          break;
       }
     }
   }
@@ -418,10 +500,11 @@ struct PatternOperand {
 };
 
 struct Annotation {
-  enum Kind { Defs, Uses, OneUse, HasUse, SameBB };
+  enum Kind { Defs, Uses, OneUse, HasUse, SameBB, Filter };
   Kind K;
   std::vector<PatternOperand> Operands;  // for @defs/@uses
   std::vector<std::string> Names;        // for @one_use/@has_use/@same_bb
+  std::string FilterExpr;               // for @filter: raw expression string
 };
 
 struct PatternLine {
@@ -429,18 +512,14 @@ struct PatternLine {
   std::string MnemRegex;       // from {{regex}} mnemonic
   std::vector<PatternOperand> Operands;
   std::vector<Annotation> Annotations;
-  bool IsRoot = false;
   bool IsAnnotationOnly = false;  // line is just @constraint(s)
+  bool IsDefAnchor = false;       // @def(%v) — matches any instruction defining %v
+  SmallVector<std::string, 2> DefAnchorNames; // capture names from @def(...)
 };
 
 // A bound value from matching.
-struct Binding {
-  enum Kind { Reg, Imm, Label };
-  Kind K;
-  MCPhysReg RegVal = 0;
-  int64_t ImmVal = 0;
-  std::string LabelVal;
-};
+using Binding = llvm::filter_expr::Binding;
+using FilterExprParser = llvm::filter_expr::FilterExprParser;
 
 // ===----------------------------------------------------------------------===//
 // Liveness analysis
@@ -511,6 +590,12 @@ static void parseAsmText(const BinaryContext &BC, const MCInst &Inst,
   BC.InstPrinter->printInst(&Inst, 0, "", *BC.STI, OS);
   StringRef S(Buf);
   S = S.ltrim();
+
+  // Strip trailing BOLT annotation comments (e.g., "# imp-def: NZCV").
+  size_t HashPos = S.find("  #");
+  if (HashPos != StringRef::npos)
+    S = S.substr(0, HashPos);
+  S = S.rtrim();
 
   // Split mnemonic from operands.
   auto [M, Rest] = S.split('\t');
@@ -828,6 +913,17 @@ static Annotation parseAnnotation(StringRef S) {
       }
     }
     // If no parentheses, Names is empty → means all matched nodes same BB.
+  } else if (S.starts_with("@filter(")) {
+    A.K = Annotation::Filter;
+    StringRef Rest = S.drop_front(8); // drop "@filter("
+    // Find matching closing paren (handle nested parens like abs(...)).
+    unsigned Depth = 1;
+    unsigned End = 0;
+    for (unsigned I = 0; I < Rest.size(); ++I) {
+      if (Rest[I] == '(') ++Depth;
+      else if (Rest[I] == ')') { if (--Depth == 0) { End = I; break; } }
+    }
+    A.FilterExpr = Rest.substr(0, End).str();
   }
 
   return A;
@@ -883,6 +979,32 @@ static std::vector<PatternLine> parsePatternFile(StringRef Contents) {
 
     // Annotation-only line: starts with @ and no mnemonic.
     if (RawLine.starts_with("@")) {
+      // Check for @def(...) — a def-anchor that matches any defining instruction.
+      if (RawLine.starts_with("@def(")) {
+        PatternLine PL;
+        PL.IsDefAnchor = true;
+        StringRef Inner = RawLine.drop_front(5); // drop "@def("
+        if (Inner.ends_with(")"))
+          Inner = Inner.drop_back(1);
+        // Parse capture names: @def(%v) or @def(%v, %w)
+        SmallVector<StringRef, 4> Names;
+        Inner.split(Names, ',');
+        for (StringRef N : Names) {
+          N = N.trim();
+          if (N.starts_with("%"))
+            N = N.drop_front(1);
+          if (!N.empty())
+            PL.DefAnchorNames.push_back(N.str());
+        }
+        if (PL.DefAnchorNames.empty()) {
+          errs() << ToolName << ": @def() requires at least one capture name: "
+                 << RawLine << "\n";
+          continue;
+        }
+        Lines.push_back(std::move(PL));
+        continue;
+      }
+
       if (Lines.empty()) {
         errs() << ToolName
                << ": annotation-only line with no preceding instruction: "
@@ -907,13 +1029,10 @@ static std::vector<PatternLine> parsePatternFile(StringRef Contents) {
       AnnotPart = RawLine.substr(AtPos + 2);
     }
 
-    // Parse "root " prefix.
-    if (InstrPart.starts_with("root ")) {
-      PL.IsRoot = true;
+    // Parse mnemonic (first token).  Ignore legacy "root" prefix.
+    if (InstrPart.starts_with("root "))
       InstrPart = InstrPart.drop_front(5).ltrim();
-    }
 
-    // Parse mnemonic (first token).
     auto [Mnemonic, Rest] = InstrPart.split(' ');
     Rest = Rest.ltrim();
 
@@ -1087,6 +1206,9 @@ static void printAnnotation(raw_ostream &OS, const Annotation &A) {
       OS << ")";
     }
     break;
+  case Annotation::Filter:
+    OS << "@filter(" << A.FilterExpr << ")";
+    break;
   }
 }
 
@@ -1153,8 +1275,6 @@ static void dumpPatternGraph(const std::vector<PatternLine> &Pattern) {
   for (unsigned I = 0; I < Pattern.size(); ++I) {
     const PatternLine &PL = Pattern[I];
     outs() << "  [" << I << "] ";
-    if (PL.IsRoot)
-      outs() << "root ";
     if (PL.IsAnnotationOnly) {
       outs() << "(annotation-only)";
     } else {
@@ -1302,8 +1422,6 @@ static void dumpPatternDot(const std::vector<PatternLine> &Pattern,
       continue;
 
     OS << "  n" << I << " [label=\"";
-    if (PL.IsRoot)
-      OS << "root ";
     if (!PL.MnemRegex.empty())
       OS << PL.Mnemonic << "\\{\\{" << PL.MnemRegex << "\\}\\}";
     else
@@ -1402,13 +1520,13 @@ static void dumpPatternDot(const std::vector<PatternLine> &Pattern,
           OS << ")";
         }
         break;
+      case Annotation::Filter:
+        OS << "@filter(" << A.FilterExpr << ")";
+        break;
       }
     }
 
-    OS << "\"";
-    if (PL.IsRoot)
-      OS << ", style=bold, penwidth=2";
-    OS << "];\n";
+    OS << "\"];\n";
   }
 
   OS << "\n";
@@ -1424,6 +1542,31 @@ static void dumpPatternDot(const std::vector<PatternLine> &Pattern,
   OS << "}\n";
 }
 
+
+/// Get the bit width of a physical register from its name.
+/// AArch64: W=32, X=64, B=8, H=16, S=32, D=64, Q=128, V=128.
+static unsigned getRegWidth(const BinaryContext &BC, MCPhysReg Reg) {
+  StringRef Name = BC.MRI->getName(Reg);
+  if (Name.empty())
+    return 0;
+  switch (Name[0]) {
+  case 'W': case 'w': return 32;
+  case 'X': case 'x': return 64;
+  case 'B': case 'b': return 8;
+  case 'H': case 'h': return 16;
+  case 'S': case 's': return 32;
+  case 'D': case 'd': return 64;
+  case 'Q': case 'q': return 128;
+  case 'V': case 'v': return 128;
+  default:
+    // Try the minimum register class covering this register.
+    for (const auto &RC : BC.MRI->regclasses()) {
+      if (RC.contains(Reg))
+        return RC.RegSizeInBits;
+    }
+    return 0;
+  }
+}
 
 // Check if an operand text names a register that aliases the bound register.
 // Since printed names may use alternate forms (e.g., "v0" for Q0 on AArch64),
@@ -1579,6 +1722,7 @@ static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
       Binding B;
       B.K = Binding::Reg;
       B.RegVal = NZCVReg;
+      B.RegWidth = getRegWidth(BC, NZCVReg);
       Bindings[PO.Name] = B;
       return true;
     }
@@ -1676,6 +1820,7 @@ static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
         Binding B;
         B.K = Binding::Reg;
         B.RegVal = FoundReg;
+        B.RegWidth = getRegWidth(BC, FoundReg);
         Bindings[PO.Name] = B;
       } else {
         Binding B;
@@ -1724,6 +1869,7 @@ static bool tryBindOperand(const BinaryContext &BC, const PatternOperand &PO,
       Binding B;
       B.K = Binding::Reg;
       B.RegVal = FoundReg;
+      B.RegWidth = getRegWidth(BC, FoundReg);
       Bindings[PO.Name] = B;
     }
     return true;
@@ -1757,6 +1903,37 @@ static bool matchLine(const BinaryContext &BC, const PatternLine &PL,
   // Annotation-only lines always match (constraints checked later).
   if (PL.IsAnnotationOnly)
     return true;
+
+  // DefAnchor (@def(%v)): matches any instruction that has at least one
+  // explicit def.  Binds each capture name to the corresponding defined
+  // register.
+  if (PL.IsDefAnchor) {
+    if (Node.Defs.empty())
+      return false;
+    for (unsigned I = 0; I < PL.DefAnchorNames.size(); ++I) {
+      const std::string &Name = PL.DefAnchorNames[I];
+      // Use the first explicit def register.  For instructions with multiple
+      // defs, we could extend this, but one def is the common case.
+      MCPhysReg DefReg = 0;
+      if (I < Node.Defs.size())
+        DefReg = Node.Defs[I];
+      else
+        DefReg = Node.Defs[0]; // fallback: reuse first def
+      auto It = Bindings.find(Name);
+      if (It != Bindings.end()) {
+        if (It->second.K != Binding::Reg ||
+            !regMatchesBinding(BC, DefReg, It->second))
+          return false;
+      } else {
+        Binding B;
+        B.K = Binding::Reg;
+        B.RegVal = DefReg;
+        B.RegWidth = getRegWidth(BC, DefReg);
+        Bindings[Name] = B;
+      }
+    }
+    return true;
+  }
 
   // Lazily parse printed assembly on first access.
   Node.ensureParsed(BC);
@@ -1828,6 +2005,7 @@ static bool matchLine(const BinaryContext &BC, const PatternLine &PL,
             Binding B;
             B.K = Binding::Reg;
             B.RegVal = NZCVReg;
+            B.RegWidth = getRegWidth(BC, NZCVReg);
             Bindings[AnnOp.Name] = B;
           }
         } else {
@@ -1876,6 +2054,7 @@ static bool matchLine(const BinaryContext &BC, const PatternLine &PL,
           Binding B;
           B.K = Binding::Reg;
           B.RegVal = NZCVReg;
+          B.RegWidth = getRegWidth(BC, NZCVReg);
           Bindings[AnnOp.Name] = B;
         }
       }
@@ -2011,6 +2190,13 @@ static void classifyCapturePositions(
     const InstrNode *Node,
     SmallVectorImpl<std::string> &DefCaptures,
     SmallVectorImpl<std::string> &UseCaptures) {
+  // DefAnchor: all names are definitions.
+  if (PL.IsDefAnchor) {
+    for (const std::string &Name : PL.DefAnchorNames)
+      DefCaptures.push_back(Name);
+    return;
+  }
+
   // @defs annotations → DefCaptures, @uses → UseCaptures.
   for (const Annotation &A : PL.Annotations) {
     if (A.K == Annotation::Defs) {
@@ -2074,7 +2260,7 @@ static void classifyCapturePositions(
 }
 
 
-// Validate post-match constraints (@one_use, @has_use, @same_bb).
+// Validate post-match constraints (@one_use, @has_use, @same_bb, @filter).
 static bool validateConstraints(
     const BinaryContext &BC, const std::vector<PatternLine> &Pattern,
     const DefUseGraph &G, const SmallVector<NodeID, 8> &MatchedNodeIDs,
@@ -2178,6 +2364,15 @@ static bool validateConstraints(
               return false;
           }
         }
+      } else if (A.K == Annotation::Filter) {
+        FilterExprParser Parser(A.FilterExpr, Bindings);
+        auto Result = Parser.evaluate();
+        if (!Result) {
+          consumeError(Result.takeError());
+          return false;
+        }
+        if (!*Result)
+          return false;
       }
     }
   }
@@ -2570,6 +2765,7 @@ static void dpMatchFunction(
     // Build MatchedNodeIDs in pattern order.
     SmallVector<NodeID, 8> MatchedNodeIDs;
     bool Complete = true;
+    DenseSet<NodeID> UsedNodes;
     for (unsigned PI = 0; PI < NumPat; ++PI) {
       if (Pattern[PI].IsAnnotationOnly)
         continue;
@@ -2578,12 +2774,17 @@ static void dpMatchFunction(
         Complete = false;
         break;
       }
+      // Each pattern line must match a distinct instruction.
+      if (!UsedNodes.insert(TIt->second).second) {
+        Complete = false;
+        break;
+      }
       MatchedNodeIDs.push_back(TIt->second);
     }
     if (!Complete)
       continue;
 
-    // Validate post-match constraints (@one_use, @same_bb, etc.).
+    // Validate post-match constraints (@one_use, @same_bb, @filter, etc.).
     if (!validateConstraints(BC, Pattern, G, MatchedNodeIDs, MergedBindings))
       continue;
 
@@ -2610,10 +2811,86 @@ static void printMatchResult(const BinaryContext &BC, const MatchResult &Result,
   outs() << "=== Match #" << MatchNum << " in " << Result.FunctionName
          << " ===\n";
 
-  for (const auto &[BI, Idx] : Result.MatchedInstrs) {
-    outs() << "  " << BI->BB->getName() << ":" << Idx << "  ";
-    BC.InstPrinter->printInst(BI->Nodes[Idx].Inst, 0, "", *BC.STI, outs());
-    outs() << "\n";
+  unsigned Ctx = opts::ContextLines;
+
+  if (Ctx == 0) {
+    // Original compact output.
+    for (const auto &[BI, Idx] : Result.MatchedInstrs) {
+      outs() << "  " << BI->BB->getName() << ":" << Idx << "  ";
+      BC.InstPrinter->printInst(BI->Nodes[Idx].Inst, 0, "", *BC.STI, outs());
+      outs() << "\n";
+    }
+  } else {
+    // Context output: show surrounding instructions with matched lines marked.
+    // Group matched instructions by BB.
+    DenseMap<const BBInfo *, SmallVector<unsigned, 4>> MatchedByBB;
+    for (const auto &[BI, Idx] : Result.MatchedInstrs)
+      MatchedByBB[BI].push_back(Idx);
+
+    for (auto &[BI, Indices] : MatchedByBB) {
+      llvm::sort(Indices);
+      unsigned NumInsts = BI->Nodes.size();
+      DenseSet<unsigned> MatchedSet(Indices.begin(), Indices.end());
+
+      // Build disjoint display windows: [lo, hi) around each matched index.
+      // Merge overlapping windows.
+      SmallVector<std::pair<unsigned, unsigned>, 4> Windows;
+      for (unsigned Idx : Indices) {
+        unsigned Lo = Idx >= Ctx ? Idx - Ctx : 0;
+        unsigned Hi = std::min(NumInsts, Idx + Ctx + 1);
+        if (!Windows.empty() && Lo <= Windows.back().second)
+          Windows.back().second = std::max(Windows.back().second, Hi);
+        else
+          Windows.push_back({Lo, Hi});
+      }
+
+      outs() << "  " << BI->BB->getName() << ":\n";
+      for (unsigned W = 0; W < Windows.size(); ++W) {
+        if (W > 0)
+          outs() << "      ...\n";
+        for (unsigned I = Windows[W].first; I < Windows[W].second; ++I) {
+          bool IsMatched = MatchedSet.count(I);
+        outs() << (IsMatched ? "  >>> " : "      ");
+        outs() << I << "\t";
+        BC.InstPrinter->printInst(BI->Nodes[I].Inst, 0, "", *BC.STI, outs());
+
+        // Annotate matched instructions with bindings.
+        if (IsMatched) {
+          SmallVector<std::pair<std::string, std::string>, 4> Annots;
+          const InstrNode &Node = BI->Nodes[I];
+          Node.ensureParsed(BC);
+          for (const auto &[Name, B] : Result.Bindings) {
+            if (B.K == Binding::Reg) {
+              bool Found = false;
+              for (MCPhysReg R : Node.Defs)
+                if (regMatchesBinding(BC, R, B)) { Found = true; break; }
+              if (!Found)
+                for (MCPhysReg R : Node.Uses)
+                  if (regMatchesBinding(BC, R, B)) { Found = true; break; }
+              if (Found)
+                Annots.push_back(
+                    {Name.str(),
+                     std::string(BC.MRI->getName(B.RegVal))});
+            } else if (B.K == Binding::Imm) {
+              // Check if the printed instruction contains this immediate.
+              std::string Printed;
+              raw_string_ostream PS(Printed);
+              BC.InstPrinter->printInst(Node.Inst, 0, "", *BC.STI, PS);
+              std::string ImmStr = ("#" + Twine(B.ImmVal)).str();
+              if (Printed.find(ImmStr) != std::string::npos)
+                Annots.push_back({Name.str(), ImmStr});
+            }
+          }
+          if (!Annots.empty()) {
+            outs() << "  //";
+            for (auto &[N, V] : Annots)
+              outs() << " %" << N << "=" << V;
+          }
+        }
+        outs() << "\n";
+        }
+      }
+    }
   }
 
   if (!Result.Bindings.empty()) {
@@ -2635,17 +2912,36 @@ static void printMatchResult(const BinaryContext &BC, const MatchResult &Result,
 /// Collect uppercase mnemonic prefixes from all non-annotation pattern lines.
 /// Used for opcode-level pre-filtering: a function must contain at least one
 /// instruction whose tablegen opcode name starts with each prefix.
+/// Prefixes that don't match any tablegen opcode are dropped (they are
+/// printed aliases like cset→CSINCWr that need the two-pass fallback).
 static SmallVector<std::string, 4>
-collectMnemPrefixes(const std::vector<PatternLine> &Pattern) {
+collectMnemPrefixes(const BinaryContext &BC,
+                    const std::vector<PatternLine> &Pattern) {
   SmallVector<std::string, 4> Prefixes;
   for (const PatternLine &PL : Pattern) {
-    if (PL.IsAnnotationOnly || PL.Mnemonic.empty())
+    if (PL.IsAnnotationOnly || PL.IsDefAnchor || PL.Mnemonic.empty())
+      continue;
+    // Skip regex mnemonics — can't build a reliable prefix.
+    if (!PL.MnemRegex.empty())
       continue;
     // Strip NEON qualifier (e.g., ".4s", ".16b") — tablegen opcode names
     // like "ADDv4i32" don't contain the dot-qualifier.
     StringRef M = PL.Mnemonic;
     M = M.split('.').first;
-    Prefixes.push_back(M.upper());
+    std::string Upper = M.upper();
+
+    // Verify this prefix matches at least one tablegen opcode name.
+    // If not, it's a printed alias (e.g., "cset" → CSINCWr) and we
+    // can't use it for function-level pre-filtering.
+    bool Valid = false;
+    for (unsigned I = 0, E = BC.MII->getNumOpcodes(); I < E; ++I) {
+      if (StringRef(BC.MII->getName(I)).starts_with_insensitive(Upper)) {
+        Valid = true;
+        break;
+      }
+    }
+    if (Valid)
+      Prefixes.push_back(std::move(Upper));
   }
   // Deduplicate.
   llvm::sort(Prefixes);
@@ -2693,7 +2989,7 @@ static void runLinearMatcher(const BinaryContext &BC,
   bool ShowProgress = errs().is_displayed();
 
   // Collect all pattern mnemonic prefixes for function-level pre-filter.
-  SmallVector<std::string, 4> Prefixes = collectMnemPrefixes(Pattern);
+  SmallVector<std::string, 4> Prefixes = collectMnemPrefixes(BC, Pattern);
 
   DefaultThreadPool Pool(hardware_concurrency(opts::ThreadCount));
   for (unsigned FIdx = 0; FIdx < Functions.size(); ++FIdx) {
@@ -2715,9 +3011,22 @@ static void runLinearMatcher(const BinaryContext &BC,
       std::vector<BBInfo> AllBBs = buildBBInfos(BC, BF);
       DenseSet<const MCInst *> LocalMatched;
 
-      // Pre-compute first pattern line mnemonic (uppercased) for fast opcode filtering.
+      // Pre-compute first pattern line mnemonic (uppercased) for fast opcode
+      // filtering. Empty if it's a printed alias (no tablegen opcode match).
       const PatternLine &FirstPL = Pattern[0];
-      std::string FirstMnemUpper = StringRef(FirstPL.Mnemonic).split('.').first.upper();
+      std::string FirstMnemUpper;
+      if (!FirstPL.MnemRegex.empty() || FirstPL.IsDefAnchor) {
+        // Regex or @def — no prefix filter possible.
+      } else {
+        std::string Cand = StringRef(FirstPL.Mnemonic).split('.').first.upper();
+        // Only use as filter if it matches a real tablegen opcode.
+        for (unsigned I = 0, E = BC.MII->getNumOpcodes(); I < E; ++I) {
+          if (StringRef(BC.MII->getName(I)).starts_with_insensitive(Cand)) {
+            FirstMnemUpper = std::move(Cand);
+            break;
+          }
+        }
+      }
 
       for (unsigned BBIdx = 0; BBIdx < AllBBs.size(); ++BBIdx) {
         for (unsigned InstIdx = 0; InstIdx < AllBBs[BBIdx].Nodes.size();
@@ -2783,7 +3092,7 @@ static void runGraphMatcher(const BinaryContext &BC,
   bool ShowProgress = errs().is_displayed();
 
   // Collect all pattern mnemonic prefixes for function-level pre-filter.
-  SmallVector<std::string, 4> Prefixes = collectMnemPrefixes(Pattern);
+  SmallVector<std::string, 4> Prefixes = collectMnemPrefixes(BC, Pattern);
 
   // Build pattern DAG once (shared across all threads — read-only).
   SmallVector<PatternEdge, 8> PatEdges;
@@ -2872,6 +3181,9 @@ static void runMatcher(const BinaryContext &BC,
       for (const Annotation &A : Pattern[I].Annotations)
         for (const PatternOperand &Op : A.Operands)
           CollectCaptures(Op);
+      // DefAnchor names are capture definitions.
+      for (const std::string &Name : Pattern[I].DefAnchorNames)
+        CaptureLines[Name].push_back(I);
     }
 
     for (const auto &[Name, Lines] : CaptureLines) {
@@ -2885,10 +3197,16 @@ static void runMatcher(const BinaryContext &BC,
     }
   }
 
-  // Also treat any pattern with an explicit 'root' as a graph pattern.
-  for (const PatternLine &PL : Pattern)
-    if (PL.IsRoot)
+  // Also treat any pattern with @def or @filter as a graph pattern
+  // (the linear matcher doesn't evaluate post-match constraints).
+  for (const PatternLine &PL : Pattern) {
+    if (PL.IsDefAnchor)
       IsGraphPattern = true;
+    for (const Annotation &A : PL.Annotations)
+      if (A.K == Annotation::Filter || A.K == Annotation::OneUse ||
+          A.K == Annotation::HasUse)
+        IsGraphPattern = true;
+  }
 
   unsigned MatchCount = 0;
   std::vector<std::pair<std::string, unsigned>> FuncHits;
@@ -4591,6 +4909,28 @@ static void processExtract(const BinaryContext &BC,
 
   std::atomic<unsigned> Count{0};
   std::atomic<unsigned> ExtractSkipped{0};
+  const unsigned Total = Functions.size();
+
+  // Progress bar helper — updates a single line on stderr.
+  // In multi-threaded mode, throttle to avoid interleaved output.
+  std::mutex ProgressMtx;
+  auto printProgress = [&]() {
+    unsigned Done = Count.load(std::memory_order_relaxed) +
+                    ExtractSkipped.load(std::memory_order_relaxed);
+    // Throttle: only update every 1% or at completion.
+    unsigned Step = std::max(1u, Total / 100);
+    if (Done % Step != 0 && Done != Total)
+      return;
+    std::lock_guard<std::mutex> Lock(ProgressMtx);
+    unsigned Pct = Total ? (Done * 100 / Total) : 100;
+    const unsigned BarWidth = 40;
+    unsigned Filled = Total ? (Done * BarWidth / Total) : BarWidth;
+    errs() << "\r[";
+    for (unsigned I = 0; I < BarWidth; ++I)
+      errs() << (I < Filled ? '=' : ' ');
+    errs() << "] " << Pct << "% (" << Done << "/" << Total << ")";
+    errs().flush();
+  };
 
   if (NumThreads <= 1) {
     // Single-threaded path — no overhead.
@@ -4611,6 +4951,7 @@ static void processExtract(const BinaryContext &BC,
         ++Count;
       else
         ++ExtractSkipped;
+      printProgress();
     }
   } else {
     // Multi-threaded path.
@@ -4652,12 +4993,14 @@ static void processExtract(const BinaryContext &BC,
           Count.fetch_add(1, std::memory_order_relaxed);
         else
           ExtractSkipped.fetch_add(1, std::memory_order_relaxed);
+        printProgress();
       });
     }
     Pool.wait();
   }
 
   Skipped += ExtractSkipped.load();
+  errs() << "\n"; // Finish progress bar line.
   outs() << "Extracted " << Count.load() << " function(s) to " << OutDir;
   if (Skipped)
     outs() << " (" << Skipped << " skipped)";
@@ -4759,15 +5102,23 @@ int main(int argc, char **argv) {
   cl::ParseCommandLineOptions(argc, argv,
                               "llvm-match - binary function matching tool\n");
 
+  // Require a subcommand.
+  bool IsExtract = static_cast<bool>(opts::ExtractCmd);
+  bool IsMatch = static_cast<bool>(opts::MatchCmd);
+  if (!IsExtract && !IsMatch) {
+    errs() << ToolName
+           << ": please specify a subcommand: 'match' or 'extract'\n";
+    cl::PrintHelpMessage(false, true);
+    return EXIT_FAILURE;
+  }
+
   // Use BinaryAnalysisMode so run() returns after CFG building without
   // attempting to rewrite the binary.
   opts::BinaryAnalysisMode = true;
 
-  bool IsExtract = static_cast<bool>(opts::ExtractCmd);
-
-  // Parse pattern file if provided (skip for extract subcommand).
+  // Parse pattern file if provided (match subcommand only).
   std::vector<PatternLine> Pattern;
-  if (!IsExtract && !opts::PatternFilename.empty()) {
+  if (IsMatch && !opts::PatternFilename.empty()) {
     auto BufOrErr = MemoryBuffer::getFile(opts::PatternFilename);
     if (!BufOrErr)
       report_error(opts::PatternFilename, BufOrErr.getError());
@@ -4790,9 +5141,9 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Parse suite file if provided (skip for extract subcommand).
+  // Parse suite file if provided (match subcommand only).
   std::vector<NamedPattern> Suite;
-  if (!IsExtract && !opts::SuiteFilename.empty()) {
+  if (IsMatch && !opts::SuiteFilename.empty()) {
     auto BufOrErr = MemoryBuffer::getFile(opts::SuiteFilename);
     if (!BufOrErr)
       report_error(opts::SuiteFilename, BufOrErr.getError());
@@ -4808,8 +5159,8 @@ int main(int argc, char **argv) {
     outs() << "\n";
   }
 
-  // If no action specified (and not extract mode), default to dump-functions.
-  if (!IsExtract && !opts::DumpFunctions && !opts::DumpLiveness &&
+  // If no action specified in match mode, default to dump-functions.
+  if (IsMatch && !opts::DumpFunctions && !opts::DumpLiveness &&
       Pattern.empty() && Suite.empty() &&
       !opts::DumpGraph.getNumOccurrences() &&
       !opts::DumpSvg.getNumOccurrences())
