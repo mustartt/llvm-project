@@ -1,4 +1,4 @@
-//===- bolt/tools/llvm-match/FilterExpr.h - Filter expression eval --------===//
+//===- bolt/tools/llvm-analysis/FilterExpr.h - Filter expression eval --------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -41,7 +41,8 @@ struct Binding {
   unsigned RegVal = 0; // MCPhysReg
   int64_t ImmVal = 0;
   std::string LabelVal;
-  unsigned RegWidth = 0; // Register width in bits (32, 64, 128, etc.)
+  unsigned RegWidth = 0;  // Register width in bits (32, 64, 128, etc.)
+  int64_t InstOffset = -1; // Instruction offset within function (-1 = unknown)
 };
 
 /// Evaluator for @filter() expressions over captured bindings.
@@ -221,6 +222,35 @@ class FilterExprParser {
       return (W == 128 || W == 16 || W == 8) ? 1 : 0;
     }
 
+    // offset(%name) — returns the instruction offset within the function.
+    if (S.substr(Pos).starts_with("offset(")) {
+      Pos += 7;
+      skipSpaces();
+      if (peek() != '%')
+        return make_error<StringError>(
+            "offset() expects a capture reference",
+            inconvertibleErrorCode());
+      ++Pos;
+      unsigned Start = Pos;
+      while (Pos < S.size() && (isAlnum(S[Pos]) || S[Pos] == '_'))
+        ++Pos;
+      StringRef Name = S.substr(Start, Pos - Start);
+      skipSpaces();
+      if (peek() != ')')
+        return make_error<StringError>("expected ')' after offset(",
+                                       inconvertibleErrorCode());
+      ++Pos;
+      auto It = Bindings.find(Name);
+      if (It == Bindings.end())
+        return make_error<StringError>("unbound capture '%" + Name.str() + "'",
+                                       inconvertibleErrorCode());
+      if (It->second.InstOffset < 0)
+        return make_error<StringError>(
+            "offset unavailable for '%" + Name.str() + "'",
+            inconvertibleErrorCode());
+      return It->second.InstOffset;
+    }
+
     // Capture reference: %name
     if (peek() == '%') {
       ++Pos;
@@ -336,8 +366,38 @@ class FilterExprParser {
     return LHS;
   }
 
-  Expected<int64_t> parseCompare() {
+  Expected<int64_t> parseBitwise() {
     auto LHS = parseAdditive();
+    if (!LHS)
+      return LHS.takeError();
+    while (true) {
+      skipSpaces();
+      // Use single & and | for bitwise (not && / ||, which are logical).
+      // Peek ahead to distinguish & from && and | from ||.
+      if (peek() == '&' && (Pos + 1 >= S.size() || S[Pos + 1] != '&')) {
+        ++Pos;
+        auto RHS = parseAdditive();
+        if (!RHS) return RHS.takeError();
+        *LHS &= *RHS;
+      } else if (peek() == '|' && (Pos + 1 >= S.size() || S[Pos + 1] != '|')) {
+        ++Pos;
+        auto RHS = parseAdditive();
+        if (!RHS) return RHS.takeError();
+        *LHS |= *RHS;
+      } else if (peek() == '^') {
+        ++Pos;
+        auto RHS = parseAdditive();
+        if (!RHS) return RHS.takeError();
+        *LHS ^= *RHS;
+      } else {
+        break;
+      }
+    }
+    return LHS;
+  }
+
+  Expected<int64_t> parseCompare() {
+    auto LHS = parseBitwise();
     if (!LHS)
       return LHS.takeError();
     skipSpaces();
@@ -346,25 +406,25 @@ class FilterExprParser {
       StringRef Op2 = S.substr(Pos, 2);
       if (Op2 == "==") {
         Pos += 2;
-        auto R = parseAdditive();
+        auto R = parseBitwise();
         if (!R) return R.takeError();
         return (*LHS == *R) ? 1 : 0;
       }
       if (Op2 == "!=") {
         Pos += 2;
-        auto R = parseAdditive();
+        auto R = parseBitwise();
         if (!R) return R.takeError();
         return (*LHS != *R) ? 1 : 0;
       }
       if (Op2 == "<=") {
         Pos += 2;
-        auto R = parseAdditive();
+        auto R = parseBitwise();
         if (!R) return R.takeError();
         return (*LHS <= *R) ? 1 : 0;
       }
       if (Op2 == ">=") {
         Pos += 2;
-        auto R = parseAdditive();
+        auto R = parseBitwise();
         if (!R) return R.takeError();
         return (*LHS >= *R) ? 1 : 0;
       }
@@ -372,13 +432,13 @@ class FilterExprParser {
     // Single-char operators.
     if (peek() == '<') {
       ++Pos;
-      auto R = parseAdditive();
+      auto R = parseBitwise();
       if (!R) return R.takeError();
       return (*LHS < *R) ? 1 : 0;
     }
     if (peek() == '>') {
       ++Pos;
-      auto R = parseAdditive();
+      auto R = parseBitwise();
       if (!R) return R.takeError();
       return (*LHS > *R) ? 1 : 0;
     }

@@ -6,19 +6,21 @@ set(LLVM_LINK_COMPONENTS
   MC
   Object
   Support
+  Symbolize
   Target
   )
 
-add_bolt_tool(llvm-match
-  llvm-match.cpp
+add_bolt_tool(llvm-analysis
+  llvm-analysis.cpp
+  Symbolizer.cpp
   DISABLE_LLVM_LINK_LLVM_DYLIB
   )
 
-target_include_directories(llvm-match PRIVATE
+target_include_directories(llvm-analysis PRIVATE
   /Users/hjiang/workspace/triskel/lib/include
   )
 
-target_link_libraries(llvm-match
+target_link_libraries(llvm-analysis
   PRIVATE
   LLVMBOLTRewrite
   LLVMBOLTUtils

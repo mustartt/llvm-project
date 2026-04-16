@@ -1,4 +1,4 @@
-//===- bolt/tools/llvm-match/llvm-match.cpp -------------------------------===//
+//===- bolt/tools/llvm-analysis/llvm-analysis.cpp -------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -20,6 +20,7 @@
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "FilterExpr.h"
+#include "Symbolizer.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/DenseMap.h"
@@ -61,7 +62,7 @@
 #include <fstream>
 #include <optional>
 
-#define DEBUG_TYPE "llvm-match"
+#define DEBUG_TYPE "llvm-analysis"
 
 using namespace llvm;
 using namespace object;
@@ -69,7 +70,7 @@ using namespace bolt;
 
 namespace opts {
 
-static cl::OptionCategory MatchCategory("llvm-match options");
+static cl::OptionCategory MatchCategory("llvm-analysis options");
 
 // --- subcommands ---
 static cl::SubCommand MatchCmd("match",
@@ -163,6 +164,11 @@ static cl::opt<unsigned>
                  cl::value_desc("N"), cl::init(0), cl::Optional,
                  cl::cat(MatchCategory), cl::sub(MatchCmd));
 
+static cl::opt<bool>
+    SymbolizeOpt("symbolize",
+                 cl::desc("resolve matches to source locations (requires debug info)"),
+                 cl::Optional, cl::cat(MatchCategory), cl::sub(MatchCmd));
+
 static cl::opt<std::string>
     OutDir("out-dir",
            cl::desc("Output directory for .mir files"),
@@ -177,9 +183,9 @@ static cl::opt<std::string>
 
 } // namespace opts
 
-static StringRef ToolName = "llvm-match";
+static StringRef ToolName = "llvm-analysis";
 
-static TimerGroup TG("llvm-match", "llvm-match timing");
+static TimerGroup TG("llvm-analysis", "llvm-analysis timing");
 static Timer TBinary("binary", "Binary loading", TG);
 static Timer TMatch("match", "Pattern matching", TG);
 
@@ -2067,6 +2073,7 @@ static bool matchLine(const BinaryContext &BC, const PatternLine &PL,
 
 struct MatchResult {
   std::string FunctionName;
+  const BinaryFunction *BF = nullptr;   // For symbolization
   std::vector<std::pair<const BBInfo *, unsigned>> MatchedInstrs; // (BB, idx)
   StringMap<Binding> Bindings;
   SmallVector<NodeID, 8> MatchedNodeIDs; // For graph matcher
@@ -2475,6 +2482,54 @@ static void buildPatternDAG(
   }
 }
 
+/// Get the byte offset of an instruction within its function.
+/// Tries MIB->getOffset() first, then falls back to computing from the
+/// BB's input offset + instruction index * 4 (AArch64 fixed-width).
+static int64_t getInstOffset(const BinaryContext &BC,
+                              const InstrNode &Node,
+                              const std::vector<BBInfo> &AllBBs) {
+  auto MaybeOff = BC.MIB->getOffset(*Node.Inst);
+  if (MaybeOff)
+    return static_cast<int64_t>(*MaybeOff);
+  // Fallback: BB offset + instruction index * 4.
+  if (Node.BBIndex < AllBBs.size()) {
+    uint32_t BBOff = AllBBs[Node.BBIndex].BB->getInputOffset();
+    return static_cast<int64_t>(BBOff) + Node.InstIndex * 4;
+  }
+  return -1;
+}
+
+/// Stamp bindings with instruction offsets from the matched nodes.
+/// For each pattern line, the captures it defines get the offset of the
+/// instruction that matched that line. This makes offset() available in @filter.
+static void stampBindingOffsets(const BinaryContext &BC,
+                                const std::vector<PatternLine> &Pattern,
+                                const DefUseGraph &G,
+                                const SmallVector<NodeID, 8> &MatchedNodeIDs,
+                                const std::vector<BBInfo> &AllBBs,
+                                StringMap<Binding> &Bindings) {
+  unsigned MI = 0;
+  for (unsigned PI = 0; PI < Pattern.size(); ++PI) {
+    if (Pattern[PI].IsAnnotationOnly)
+      continue;
+    if (MI >= MatchedNodeIDs.size())
+      break;
+    NodeID NID = MatchedNodeIDs[MI++];
+    int64_t Off = getInstOffset(BC, G.Nodes[NID], AllBBs);
+    if (Off < 0)
+      continue;
+
+    // Find which captures this pattern line defines.
+    SmallVector<std::string, 4> Defs, Uses;
+    classifyCapturePositions(BC, Pattern[PI], &G.Nodes[NID], Defs, Uses);
+    for (const std::string &Name : Defs) {
+      auto It = Bindings.find(Name);
+      if (It != Bindings.end())
+        It->second.InstOffset = Off;
+    }
+  }
+}
+
 /// Run DP matching on a single function.  Returns all complete matches.
 static void dpMatchFunction(
     const BinaryContext &BC,
@@ -2784,6 +2839,10 @@ static void dpMatchFunction(
     if (!Complete)
       continue;
 
+    // Stamp bindings with instruction offsets before constraint validation
+    // so @filter can use offset().
+    stampBindingOffsets(BC, Pattern, G, MatchedNodeIDs, AllBBs, MergedBindings);
+
     // Validate post-match constraints (@one_use, @same_bb, @filter, etc.).
     if (!validateConstraints(BC, Pattern, G, MatchedNodeIDs, MergedBindings))
       continue;
@@ -2814,9 +2873,12 @@ static void printMatchResult(const BinaryContext &BC, const MatchResult &Result,
   unsigned Ctx = opts::ContextLines;
 
   if (Ctx == 0) {
-    // Original compact output.
+    // Original compact output — show offset if available.
     for (const auto &[BI, Idx] : Result.MatchedInstrs) {
-      outs() << "  " << BI->BB->getName() << ":" << Idx << "  ";
+      outs() << "  " << BI->BB->getName() << ":" << Idx;
+      uint32_t BBOff = BI->BB->getInputOffset();
+      outs() << " [+" << format_hex(BBOff + Idx * 4, 1) << "]";
+      outs() << "  ";
       BC.InstPrinter->printInst(BI->Nodes[Idx].Inst, 0, "", *BC.STI, outs());
       outs() << "\n";
     }
@@ -2895,6 +2957,7 @@ static void printMatchResult(const BinaryContext &BC, const MatchResult &Result,
 
   if (!Result.Bindings.empty()) {
     outs() << "  Bindings:\n";
+    int64_t MinOff = INT64_MAX, MaxOff = INT64_MIN;
     for (const auto &[Name, B] : Result.Bindings) {
       outs() << "    %" << Name << " = ";
       if (B.K == Binding::Reg)
@@ -2903,8 +2966,15 @@ static void printMatchResult(const BinaryContext &BC, const MatchResult &Result,
         outs() << "#" << B.ImmVal;
       else
         outs() << B.LabelVal;
+      if (B.InstOffset >= 0) {
+        outs() << " @+" << format_hex(B.InstOffset, 1);
+        MinOff = std::min(MinOff, B.InstOffset);
+        MaxOff = std::max(MaxOff, B.InstOffset);
+      }
       outs() << "\n";
     }
+    if (MinOff != INT64_MAX && MaxOff != INT64_MIN && MinOff != MaxOff)
+      outs() << "  Span: " << (MaxOff - MinOff) << " bytes\n";
   }
   outs() << "\n";
 }
@@ -2978,7 +3048,9 @@ static bool functionHasAllOpcodes(const BinaryContext &BC,
 static void runLinearMatcher(const BinaryContext &BC,
                              const std::vector<PatternLine> &Pattern,
                              unsigned &MatchCount,
-                             std::vector<std::pair<std::string, unsigned>> &FuncHits) {
+                             std::vector<std::pair<std::string, unsigned>> &FuncHits,
+                             match_tool::MatchSymbolizer *Symbolizer,
+                             match_tool::SourceAggregator *Agg) {
   SmallVector<const BinaryFunction *, 0> Functions;
   for (const auto &[Addr, BF] : BC.getBinaryFunctions())
     Functions.push_back(&BF);
@@ -3047,6 +3119,7 @@ static void runLinearMatcher(const BinaryContext &BC,
             const auto &[FirstBI, FirstIdx] = Result.MatchedInstrs.front();
             LocalMatched.insert(FirstBI->Nodes[FirstIdx].Inst);
             Result.FunctionName = BF.getPrintName();
+            Result.BF = &BF;
             AllResults[FIdx].Matches.push_back(std::move(Result));
           }
         }
@@ -3071,6 +3144,11 @@ static void runLinearMatcher(const BinaryContext &BC,
       ++MatchCount;
       if (opts::OutputLevel == opts::OM_Detailed)
         printMatchResult(BC, Result, MatchCount);
+      if (Agg && Symbolizer && Result.BF && !Result.MatchedInstrs.empty()) {
+        const auto &[BI, Idx] = Result.MatchedInstrs.back();
+        auto Loc = Symbolizer->resolve(BC, *Result.BF, *BI->Nodes[Idx].Inst);
+        Agg->record(Loc);
+      }
     }
     if (!FR.Matches.empty())
       FuncHits.emplace_back(FR.Matches.front().FunctionName,
@@ -3081,7 +3159,9 @@ static void runLinearMatcher(const BinaryContext &BC,
 static void runGraphMatcher(const BinaryContext &BC,
                             const std::vector<PatternLine> &Pattern,
                             unsigned &MatchCount,
-                            std::vector<std::pair<std::string, unsigned>> &FuncHits) {
+                            std::vector<std::pair<std::string, unsigned>> &FuncHits,
+                            match_tool::MatchSymbolizer *Symbolizer,
+                            match_tool::SourceAggregator *Agg) {
   SmallVector<const BinaryFunction *, 0> Functions;
   for (const auto &[Addr, BF] : BC.getBinaryFunctions())
     Functions.push_back(&BF);
@@ -3125,6 +3205,7 @@ static void runGraphMatcher(const BinaryContext &BC,
                       FuncMatches);
       for (auto &R : FuncMatches) {
         R.FunctionName = BF.getPrintName();
+        R.BF = &BF;
         AllResults[FIdx].Matches.push_back(std::move(R));
       }
 
@@ -3147,6 +3228,11 @@ static void runGraphMatcher(const BinaryContext &BC,
       ++MatchCount;
       if (opts::OutputLevel == opts::OM_Detailed)
         printMatchResult(BC, Result, MatchCount);
+      if (Agg && Symbolizer && Result.BF && !Result.MatchedInstrs.empty()) {
+        const auto &[BI, Idx] = Result.MatchedInstrs.back();
+        auto Loc = Symbolizer->resolve(BC, *Result.BF, *BI->Nodes[Idx].Inst);
+        Agg->record(Loc);
+      }
     }
     if (!FR.Matches.empty())
       FuncHits.emplace_back(FR.Matches.front().FunctionName,
@@ -3208,13 +3294,25 @@ static void runMatcher(const BinaryContext &BC,
         IsGraphPattern = true;
   }
 
+  // Create symbolizer for source-level aggregation (if requested).
+  std::unique_ptr<match_tool::MatchSymbolizer> Symbolizer;
+  match_tool::SourceAggregator Agg;
+  match_tool::MatchSymbolizer *SymPtr = nullptr;
+  match_tool::SourceAggregator *AggPtr = nullptr;
+  if (opts::SymbolizeOpt) {
+    Symbolizer = std::make_unique<match_tool::MatchSymbolizer>(
+        opts::InputFilename);
+    SymPtr = Symbolizer.get();
+    AggPtr = &Agg;
+  }
+
   unsigned MatchCount = 0;
   std::vector<std::pair<std::string, unsigned>> FuncHits;
   if (IsGraphPattern) {
     outs() << "Using graph-based DP matcher\n";
-    runGraphMatcher(BC, Pattern, MatchCount, FuncHits);
+    runGraphMatcher(BC, Pattern, MatchCount, FuncHits, SymPtr, AggPtr);
   } else {
-    runLinearMatcher(BC, Pattern, MatchCount, FuncHits);
+    runLinearMatcher(BC, Pattern, MatchCount, FuncHits, SymPtr, AggPtr);
   }
 
   if (opts::OutputLevel == opts::OM_Summary) {
@@ -3229,6 +3327,19 @@ static void runMatcher(const BinaryContext &BC,
   }
 
   outs() << "Total matches: " << MatchCount << "\n";
+
+  // Print source-level aggregation if --symbolize was requested.
+  if (AggPtr) {
+    if (Agg.Resolved > 0) {
+      outs() << "\nSource aggregation:\n";
+      Agg.printByFile(outs(), 15);
+      Agg.printByLocation(outs(), 20);
+    } else {
+      outs() << "\nNo source locations resolved (" << Agg.Unresolved
+             << " unresolved). Binary may lack debug info.\n"
+             << "  Hint: on macOS, run `dsymutil <binary>` to generate a .dSYM\n";
+    }
+  }
 }
 
 // ===----------------------------------------------------------------------===//
@@ -4941,7 +5052,7 @@ static void processExtract(const BinaryContext &BC,
       return;
     }
     LLVMContext Ctx;
-    Module IRMod("llvm-match-extract", Ctx);
+    Module IRMod("llvm-analysis-extract", Ctx);
     IRMod.setTargetTriple(NormalizedTriple);
     IRMod.setDataLayout(TM->createDataLayout());
     MachineModuleInfo MMI(TM.get());
@@ -4977,7 +5088,7 @@ static void processExtract(const BinaryContext &BC,
             *BC.TheTriple, "", "", TargetOptions(), std::nullopt));
         Ptr->Ctx = std::make_unique<LLVMContext>();
         Ptr->IRMod =
-            std::make_unique<Module>("llvm-match-extract", *Ptr->Ctx);
+            std::make_unique<Module>("llvm-analysis-extract", *Ptr->Ctx);
         Ptr->IRMod->setTargetTriple(NormalizedTriple);
         Ptr->IRMod->setDataLayout(Ptr->TM->createDataLayout());
         Ptr->MMI = std::make_unique<MachineModuleInfo>(Ptr->TM.get());
@@ -5100,7 +5211,7 @@ int main(int argc, char **argv) {
 
   cl::HideUnrelatedOptions(opts::MatchCategory);
   cl::ParseCommandLineOptions(argc, argv,
-                              "llvm-match - binary function matching tool\n");
+                              "llvm-analysis - binary function matching tool\n");
 
   // Require a subcommand.
   bool IsExtract = static_cast<bool>(opts::ExtractCmd);
