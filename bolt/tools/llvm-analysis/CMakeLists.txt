@@ -5,6 +5,7 @@ set(LLVM_LINK_COMPONENTS
   Core
   MC
   Object
+  Remarks
   Support
   Symbolize
   Target
