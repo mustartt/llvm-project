@@ -5519,6 +5519,398 @@ static void emitCallGraphDot(const UnifiedCallGraph &UCG, raw_ostream &OS) {
 }
 
 // ===----------------------------------------------------------------------===//
+// Call graph: Triskel SVG export (Sugiyama + SESE layout)
+// ===----------------------------------------------------------------------===//
+
+/// Build a plain-text label for a call graph node.  The label is measured by
+/// the Triskel renderer to determine node dimensions.
+static std::string buildCGNodeLabel(const CGNode &N, unsigned Idx) {
+  std::string Label;
+  raw_string_ostream OS(Label);
+
+  // Shorten name for display.
+  std::string DisplayName = N.Name;
+  auto UPos = DisplayName.find(".__uniq.");
+  if (UPos != std::string::npos)
+    DisplayName = DisplayName.substr(0, UPos) + ".__uniq~";
+  if (DisplayName.size() > 50)
+    DisplayName = DisplayName.substr(0, 47) + "...";
+
+  OS << DisplayName << "\n";
+  OS << "samples=" << formatSamples(N.ExecCount) << " size=" << N.Size << "\n";
+
+  // Inline tree (text version) — cap at MaxInlineRows entries.
+  auto emitTreeText =
+      [&](const auto &Self, const std::vector<InlineTreeEntry> &Entries,
+          unsigned Depth, unsigned Emitted) -> unsigned {
+    for (const auto &E : Entries) {
+      if (Emitted >= MaxInlineRows)
+        return Emitted;
+      ++Emitted;
+      for (unsigned D = 0; D < Depth; ++D)
+        OS << "  ";
+      if (Depth > 0)
+        OS << "L ";
+      std::string IName = E.Name;
+      auto UP = IName.find(".__uniq.");
+      if (UP != std::string::npos)
+        IName = IName.substr(0, UP) + ".__uniq~";
+      if (IName.size() > 40)
+        IName = IName.substr(0, 37) + "...";
+      OS << IName;
+      if (E.Samples > 0)
+        OS << " (" << formatSamples(E.Samples) << ")";
+      OS << "\n";
+      Emitted = Self(Self, E.Children, Depth + 1, Emitted);
+    }
+    return Emitted;
+  };
+
+  if (!N.InlineTree.empty()) {
+    OS << "inlined:\n";
+    unsigned Total = countInlineTree(N.InlineTree);
+    emitTreeText(emitTreeText, N.InlineTree, 1, 0);
+    if (Total > MaxInlineRows)
+      OS << "  ...and " << (Total - MaxInlineRows) << " more\n";
+  } else if (!N.InlinedCallees.empty()) {
+    OS << "inlined: ";
+    for (unsigned J = 0; J < N.InlinedCallees.size(); ++J) {
+      if (J > 0)
+        OS << ", ";
+      if (J >= 5) {
+        OS << "...(" << (N.InlinedCallees.size() - J) << " more)";
+        break;
+      }
+      OS << N.InlinedCallees[J].Callee;
+    }
+    OS << "\n";
+  }
+
+  // Remove trailing newline.
+  while (!Label.empty() && Label.back() == '\n')
+    Label.pop_back();
+  return Label;
+}
+
+/// Convert HSL hue-based heat color to triskel::Color for node backgrounds.
+/// Uses lighter pastel version (higher lightness) for better text readability.
+static triskel::Color cgHeatColorRGB(double T) {
+  if (T < 0.0) T = 0.0;
+  if (T > 1.0) T = 1.0;
+  double Hue = T * 240.0;
+  // HSL(Hue, 80%, 85%) for pastel backgrounds
+  double S = 0.80, L = 0.85;
+  double C = (1.0 - std::fabs(2.0 * L - 1.0)) * S;
+  double X = C * (1.0 - std::fabs(std::fmod(Hue / 60.0, 2.0) - 1.0));
+  double M = L - C / 2.0;
+  double R1 = 0, G1 = 0, B1 = 0;
+  if (Hue < 60)       { R1 = C; G1 = X; }
+  else if (Hue < 120) { R1 = X; G1 = C; }
+  else if (Hue < 180) { G1 = C; B1 = X; }
+  else                 { G1 = X; B1 = C; }
+  return {static_cast<uint8_t>((R1 + M) * 255),
+          static_cast<uint8_t>((G1 + M) * 255),
+          static_cast<uint8_t>((B1 + M) * 255), 255};
+}
+
+/// Emit call graph as SVG using Triskel's Sugiyama/SESE layout engine.
+static void emitCallGraphSvg(const UnifiedCallGraph &UCG,
+                               const std::filesystem::path &OutPath) {
+  // Format a float without scientific notation for clean SVG output.
+  auto F = [](float V) -> std::string {
+    char Buf[32];
+    snprintf(Buf, sizeof(Buf), "%.1f", V);
+    return Buf;
+  };
+
+  // Compute percentile ranks for coloring.
+  std::vector<std::pair<uint64_t, uint32_t>> Ranked;
+  for (uint32_t I = 0; I < UCG.Nodes.size(); ++I)
+    Ranked.push_back({UCG.Nodes[I].ExecCount, I});
+  llvm::sort(Ranked,
+             [](const auto &A, const auto &B) { return A.first > B.first; });
+  DenseMap<uint32_t, double> NodePercentile;
+  for (unsigned R = 0; R < Ranked.size(); ++R) {
+    double Pct = Ranked.size() > 1
+                     ? static_cast<double>(R) / (Ranked.size() - 1)
+                     : 0.0;
+    NodePercentile[Ranked[R].second] = Pct;
+  }
+
+  double MaxWeight = 1.0;
+  for (const auto &E : UCG.Edges)
+    MaxWeight = std::max(MaxWeight, E.Weight);
+
+  // Edge percentile ranks for coloring.
+  std::vector<std::pair<double, unsigned>> EdgeRanked;
+  for (unsigned EI = 0; EI < UCG.Edges.size(); ++EI)
+    EdgeRanked.push_back({UCG.Edges[EI].Weight, EI});
+  llvm::sort(EdgeRanked,
+             [](const auto &A, const auto &B) { return A.first > B.first; });
+  DenseMap<unsigned, double> EdgePercentile;
+  for (unsigned R = 0; R < EdgeRanked.size(); ++R) {
+    double Pct = EdgeRanked.size() > 1
+                     ? static_cast<double>(R) / (EdgeRanked.size() - 1)
+                     : 0.0;
+    EdgePercentile[EdgeRanked[R].second] = Pct;
+  }
+
+  // Create renderer with smaller font/padding for call graphs.
+  SvgRenderer Renderer;
+  Renderer.STYLE_TEXT = {/*size=*/12.0F, /*line_height=*/16.0F,
+                         triskel::Black};
+  Renderer.BLOCK_PADDING = 8.0F;
+  Renderer.PADDING = 40.0F;
+  Renderer.STYLE_BASICBLOCK_BORDER = {1.0F, triskel::Black};
+  Renderer.STYLE_EDGE = {1.0F, triskel::Black};
+  Renderer.STYLE_EDGE_T = {1.0F, triskel::Black};
+  Renderer.STYLE_EDGE_F = {1.0F, triskel::Black};
+
+  auto Builder = triskel::make_layout_builder();
+
+  // Triskel's Sugiyama/SESE layout assumes a single-entry single-exit
+  // reducible CFG.  Call graphs are arbitrary directed graphs — they may have
+  // multiple roots, multiple leaves, disconnected components, and arbitrary
+  // cycles.  To make the graph acceptable to SESE analysis we add:
+  //   1. A synthetic ROOT node with edges to every real root (no incoming).
+  //   2. A synthetic EXIT node with edges from every real leaf (no outgoing).
+  //   3. A back-edge EXIT→ROOT to close the graph.
+  // Both synthetic nodes are invisible (1×1 pixel) and their edges are hidden.
+  size_t SyntheticRootID = Builder->make_node(1.0f, 1.0f);
+
+  // Build labels and add nodes.
+  std::vector<std::string> Labels(UCG.Nodes.size());
+  std::vector<size_t> NodeIDs(UCG.Nodes.size());
+  for (uint32_t I = 0; I < UCG.Nodes.size(); ++I) {
+    Labels[I] = buildCGNodeLabel(UCG.Nodes[I], I);
+    NodeIDs[I] = Builder->make_node(Renderer, Labels[I]);
+  }
+
+  // Synthetic EXIT node.
+  size_t SyntheticExitID = Builder->make_node(1.0f, 1.0f);
+
+  // Determine roots (no incoming) and leaves (no outgoing), excluding self-loops.
+  DenseSet<uint32_t> HasIncoming, HasOutgoing;
+  for (const auto &E : UCG.Edges) {
+    if (E.SrcIdx == E.DstIdx)
+      continue;
+    HasIncoming.insert(E.DstIdx);
+    HasOutgoing.insert(E.SrcIdx);
+  }
+
+  // Connect synthetic root to all real roots.
+  std::vector<size_t> SyntheticEdgeIDs;
+  bool AnyRoot = false;
+  for (uint32_t I = 0; I < UCG.Nodes.size(); ++I) {
+    if (!HasIncoming.contains(I)) {
+      SyntheticEdgeIDs.push_back(
+          Builder->make_edge(SyntheticRootID, NodeIDs[I]));
+      AnyRoot = true;
+    }
+  }
+  if (!AnyRoot) {
+    // All cyclic — connect synthetic root to all nodes.
+    for (uint32_t I = 0; I < UCG.Nodes.size(); ++I)
+      SyntheticEdgeIDs.push_back(
+          Builder->make_edge(SyntheticRootID, NodeIDs[I]));
+  }
+
+  // Connect all real leaves to synthetic exit.
+  bool AnyLeaf = false;
+  for (uint32_t I = 0; I < UCG.Nodes.size(); ++I) {
+    if (!HasOutgoing.contains(I)) {
+      SyntheticEdgeIDs.push_back(
+          Builder->make_edge(NodeIDs[I], SyntheticExitID));
+      AnyLeaf = true;
+    }
+  }
+  if (!AnyLeaf) {
+    // All cyclic — connect all nodes to exit.
+    for (uint32_t I = 0; I < UCG.Nodes.size(); ++I)
+      SyntheticEdgeIDs.push_back(
+          Builder->make_edge(NodeIDs[I], SyntheticExitID));
+  }
+
+  // Back-edge EXIT → ROOT to close the single-entry single-exit structure.
+  SyntheticEdgeIDs.push_back(
+      Builder->make_edge(SyntheticExitID, SyntheticRootID));
+
+  // Add real edges (skip self-loops — Triskel doesn't handle them).
+  std::vector<size_t> EdgeIDs(UCG.Edges.size());
+  for (unsigned EI = 0; EI < UCG.Edges.size(); ++EI) {
+    const auto &E = UCG.Edges[EI];
+    if (E.SrcIdx == E.DstIdx)
+      continue; // skip self-loops
+    EdgeIDs[EI] = Builder->make_edge(NodeIDs[E.SrcIdx], NodeIDs[E.DstIdx]);
+  }
+
+  // Run Sugiyama/SESE layout.
+  auto Layout = Builder->build();
+  float GraphW = Layout->get_width();
+  float GraphH = Layout->get_height();
+
+  // --- Build SVG manually using layout coordinates ---
+  float Padding = Renderer.PADDING;
+  float LegendH = 200.0F;
+  float TotalW = GraphW + 2 * Padding;
+  float TotalH = GraphH + 2 * Padding + LegendH;
+
+  std::string Svg;
+  raw_string_ostream SO(Svg);
+  SO << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+  SO << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\""
+     << static_cast<int>(TotalW) << "\" height=\""
+     << static_cast<int>(TotalH) << "\">\n";
+  SO << "<rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n";
+  SO << "<g transform=\"translate(" << F(Padding) << "," << F(Padding)
+     << ")\">\n";
+
+  // Draw edges first (below nodes).
+  for (unsigned EI = 0; EI < UCG.Edges.size(); ++EI) {
+    const auto &E = UCG.Edges[EI];
+    if (E.SrcIdx == E.DstIdx)
+      continue; // self-loops were skipped during layout
+    const auto &Waypoints = Layout->get_waypoints(EdgeIDs[EI]);
+    double Pct = EdgePercentile.lookup(EI);
+    std::string Color = cgHeatColor(Pct);
+    double PenWidth = 1.0 + 9.0 * (1.0 - Pct);
+
+    if (Waypoints.size() >= 2) {
+      SO << "<polyline points=\"";
+      for (unsigned W = 0; W < Waypoints.size(); ++W) {
+        if (W > 0) SO << " ";
+        SO << F(Waypoints[W].x) << "," << F(Waypoints[W].y);
+      }
+      SO << "\" fill=\"none\" stroke=\"" << Color << "\" stroke-width=\""
+         << format("%.1f", PenWidth) << "\"/>\n";
+
+      // Arrowhead at last segment.
+      auto &P1 = Waypoints[Waypoints.size() - 2];
+      auto &P2 = Waypoints[Waypoints.size() - 1];
+      float DX = P2.x - P1.x, DY = P2.y - P1.y;
+      float Len = std::sqrt(DX * DX + DY * DY);
+      if (Len > 0.001f) {
+        float UX = DX / Len, UY = DY / Len;
+        float ArrowLen = 8.0f;
+        float ArrowW = 4.0f;
+        float AX = P2.x - ArrowLen * UX;
+        float AY = P2.y - ArrowLen * UY;
+        SO << "<polygon points=\""
+           << F(P2.x) << "," << F(P2.y) << " "
+           << F(AX - ArrowW * UY) << "," << F(AY + ArrowW * UX) << " "
+           << F(AX + ArrowW * UY) << "," << F(AY - ArrowW * UX)
+           << "\" fill=\"" << Color << "\"/>\n";
+      }
+    }
+
+    // Edge label (weight).
+    if (E.Weight > 0 && Waypoints.size() >= 2) {
+      unsigned Mid = Waypoints.size() / 2;
+      float LX = Waypoints[Mid].x;
+      float LY = Waypoints[Mid].y - 3;
+      SO << "<text x=\"" << F(LX) << "\" y=\"" << F(LY)
+         << "\" font-family=\"Courier,monospace\" font-size=\"9\""
+         << " text-anchor=\"middle\" fill=\"#333\">"
+         << formatSamples(static_cast<uint64_t>(E.Weight)) << "</text>\n";
+    }
+  }
+
+  // Draw nodes.
+  float LineH = Renderer.STYLE_TEXT.line_height;
+  float BlockPad = Renderer.BLOCK_PADDING;
+  for (uint32_t I = 0; I < UCG.Nodes.size(); ++I) {
+    auto Coords = Layout->get_coords(NodeIDs[I]);
+    float NX = Coords.x;
+    float NY = Coords.y;
+
+    // Measure text dimensions.
+    auto Dims = Renderer.measure_text(Labels[I], Renderer.STYLE_TEXT);
+    float NW = Dims.x;
+    float NH = Dims.y;
+
+    const auto &N = UCG.Nodes[I];
+    double Pct = NodePercentile.lookup(I);
+    triskel::Color FillC = (N.ExecCount == 0 && !N.HasProfile)
+                               ? triskel::Color{0xf0, 0xf0, 0xf0, 255}
+                               : cgHeatColorRGB(Pct);
+    char FillHex[8];
+    snprintf(FillHex, sizeof(FillHex), "#%02x%02x%02x", FillC.r, FillC.g,
+             FillC.b);
+
+    // Background rectangle.
+    SO << "<rect x=\"" << F(NX) << "\" y=\"" << F(NY) << "\" width=\""
+       << F(NW) << "\" height=\"" << F(NH) << "\" fill=\"" << FillHex
+       << "\" stroke=\"#333\" stroke-width=\"1\" rx=\"3\"/>\n";
+
+    // Text lines.
+    float TX = NX + BlockPad;
+    float TY = NY + BlockPad + LineH * 0.8f;
+    SmallVector<StringRef, 16> TextLines;
+    StringRef(Labels[I]).split(TextLines, '\n');
+    for (unsigned Li = 0; Li < TextLines.size(); ++Li) {
+      std::string LineText = cgHtmlEscape(TextLines[Li]);
+      if (Li == 0) {
+        SO << "<text x=\"" << F(TX) << "\" y=\"" << F(TY)
+           << "\" font-family=\"Courier,monospace\" font-size=\""
+           << F(Renderer.STYLE_TEXT.size)
+           << "\" font-weight=\"bold\" fill=\"#000\">"
+           << LineText << "</text>\n";
+      } else {
+        bool IsInline = (TextLines[Li].starts_with("inlined") ||
+                         TextLines[Li].starts_with("  ") ||
+                         TextLines[Li].starts_with("L "));
+        const char *TextColor = IsInline ? "#2e7d32" : "#333";
+        SO << "<text x=\"" << F(TX) << "\" y=\"" << F(TY)
+           << "\" font-family=\"Courier,monospace\" font-size=\""
+           << F(Renderer.STYLE_TEXT.size) << "\" fill=\"" << TextColor << "\">"
+           << LineText << "</text>\n";
+      }
+      TY += LineH;
+    }
+  }
+
+  SO << "</g>\n";
+
+  // Legend at bottom.
+  float LegendY = GraphH + 2 * Padding + 10;
+  float LegendX = 20;
+  SO << "<text x=\"" << F(LegendX) << "\" y=\"" << F(LegendY)
+     << "\" font-family=\"Helvetica,sans-serif\" font-size=\"14\""
+     << " font-weight=\"bold\" fill=\"#333\">Call Graph: "
+     << cgHtmlEscape(UCG.BinaryName) << "</text>\n";
+  LegendY += 22;
+  SO << "<text x=\"" << F(LegendX) << "\" y=\"" << F(LegendY)
+     << "\" font-family=\"Helvetica,sans-serif\" font-size=\"11\""
+     << " font-weight=\"bold\" fill=\"#666\">Hotness</text>\n";
+  LegendY += 16;
+  struct LegendEntry { const char *label; double pct; };
+  LegendEntry LegendEntries[] = {
+    {"Top 0% (hottest)", 0.00},  {"Top 10%", 0.10},
+    {"Top 25%", 0.25},           {"Top 50%", 0.50},
+    {"Top 75%", 0.75},           {"Top 100% (coldest)", 1.00},
+  };
+  for (const auto &LE : LegendEntries) {
+    triskel::Color LC = cgHeatColorRGB(LE.pct);
+    char LCHex[8];
+    snprintf(LCHex, sizeof(LCHex), "#%02x%02x%02x", LC.r, LC.g, LC.b);
+    SO << "<rect x=\"" << F(LegendX) << "\" y=\"" << F(LegendY - 10)
+       << "\" width=\"16\" height=\"14\" fill=\"" << LCHex
+       << "\" stroke=\"#ccc\" stroke-width=\"0.5\"/>\n";
+    SO << "<text x=\"" << F(LegendX + 22) << "\" y=\"" << F(LegendY)
+       << "\" font-family=\"Helvetica,sans-serif\" font-size=\"10\""
+       << " fill=\"#333\">" << LE.label << "</text>\n";
+    LegendY += 18;
+  }
+
+  SO << "</svg>\n";
+
+  // Write to file.
+  std::ofstream Ofs(OutPath);
+  Ofs << Svg;
+  Ofs.close();
+}
+
+// ===----------------------------------------------------------------------===//
 // Call graph: build from BOLT + profile + remarks
 // ===----------------------------------------------------------------------===//
 
@@ -6199,15 +6591,21 @@ static void processCallGraph(const BinaryContext &ConstBC) {
     outs() << "Wrote serialized call graph to " << opts::CGOutput << "\n";
   }
 
-  // 8. Optionally emit DOT
+  // 8. Optionally visualize
   if (opts::CGVisualize) {
-    // Derive .dot path from -o path
-    std::string DotPath = opts::CGOutput.getValue();
-    auto DotPos = DotPath.rfind('.');
+    // Derive output paths from -o path.
+    std::string BasePath = opts::CGOutput.getValue();
+    auto DotPos = BasePath.rfind('.');
     if (DotPos != std::string::npos)
-      DotPath = DotPath.substr(0, DotPos);
-    DotPath += ".dot";
+      BasePath = BasePath.substr(0, DotPos);
 
+    // SVG via Triskel layout engine (Sugiyama + SESE crossing minimization).
+    std::string SvgPath = BasePath + ".svg";
+    emitCallGraphSvg(UCG, SvgPath);
+    outs() << "Wrote call graph SVG to " << SvgPath << "\n";
+
+    // Also emit DOT for Graphviz-based rendering if desired.
+    std::string DotPath = BasePath + ".dot";
     std::error_code EC;
     raw_fd_ostream DotFile(DotPath, EC);
     if (EC) {
