@@ -107,120 +107,159 @@ PreservedAnalyses MatroidInlinerPass::run(Module &M,
     return static_cast<unsigned>(Orig * MatroidGrowthFactor);
   };
 
-  // Step 2: Collect all call sites and evaluate with InlineCost.
-  std::vector<InlineCandidate> Candidates;
-  for (Function &F : M) {
-    if (F.isDeclaration())
-      continue;
-    for (Instruction &I : instructions(F)) {
-      auto *CB = dyn_cast<CallBase>(&I);
-      if (!CB)
-        continue;
-      Function *Callee = CB->getCalledFunction();
-      if (!Callee || Callee->isDeclaration())
-        continue;
-
-      auto &CalleeTTI = FAM.getResult<TargetIRAnalysis>(*Callee);
-      InlineCost IC = getInlineCost(*CB, Callee, Params, CalleeTTI,
-                                     GetAssumptionCache, GetTLI, GetBFI,
-                                     PSI, nullptr, GetEVC);
-      if (IC.isNever())
-        continue;
-
-      unsigned CalleeSize = Callee->getInstructionCount();
-      int CostDelta;
-      bool Always = false;
-      if (IC.isAlways()) {
-        CostDelta = 100000; // Very high priority
-        Always = true;
-      } else {
-        CostDelta = IC.getCostDelta();
-        if (CostDelta <= 0)
-          continue;
-      }
-
-      Candidates.push_back(
-          InlineCandidate{CB, &F, Callee, CostDelta, CalleeSize, Always});
-    }
-  }
-
-  LLVM_DEBUG(dbgs() << "[MatroidInline] " << Candidates.size()
-                    << " candidates across module\n");
-
-  // Step 3: Sort by benefit (CostDelta) descending — greedy order.
-  llvm::sort(Candidates, [](const InlineCandidate &A,
-                             const InlineCandidate &B) {
-    return A.CostDelta > B.CostDelta;
-  });
-
-  // Step 4: Greedy with per-function growth budget.
+  // Step 2-4: Iterative inline rounds.
+  // Each round: collect candidates, evaluate InlineCost, sort by benefit,
+  // greedily inline within budget. New call sites from inlining become
+  // candidates in the next round (with decayed benefit).
   bool Changed = false;
   SmallPtrSet<Function *, 16> DeadFunctions;
+  constexpr unsigned MaxRounds = 4;
+  constexpr float TransitiveDecay = 0.7f;
 
-  for (auto &Cand : Candidates) {
-    // Skip if callee was deleted.
-    if (DeadFunctions.count(Cand.Callee))
-      continue;
-    // Verify call site still targets expected callee.
-    if (Cand.CB->getCalledFunction() != Cand.Callee)
-      continue;
+  auto CollectCandidates = [&](SmallVectorImpl<Function *> *OnlyFunctions,
+                               float BenefitMultiplier)
+      -> std::vector<InlineCandidate> {
+    std::vector<InlineCandidate> Candidates;
+    auto Process = [&](Function &F) {
+      if (F.isDeclaration() || DeadFunctions.count(&F))
+        return;
+      for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB)
+          continue;
+        Function *Callee = CB->getCalledFunction();
+        if (!Callee || Callee->isDeclaration() || DeadFunctions.count(Callee))
+          continue;
 
-    // Per-caller growth budget (partition matroid constraint).
-    unsigned Growth = GrowthSoFar.lookup(Cand.Caller);
-    unsigned Budget = GetBudget(Cand.Caller);
-    if (!Cand.AlwaysInline && Growth + Cand.CalleeSize > Budget) {
-      ++NumMatroidRejected;
-      auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(*Cand.Caller);
-      using namespace ore;
-      ORE.emit([&]() {
-        return OptimizationRemarkMissed(DEBUG_TYPE, "BudgetExceeded", Cand.CB)
-               << NV("Callee", Cand.Callee)
-               << " not inlined into "
-               << NV("Caller", Cand.Caller)
-               << " (growth " << NV("Growth", Growth)
-               << " + " << NV("CalleeSize", Cand.CalleeSize)
-               << " exceeds budget " << NV("Budget", Budget) << ")";
-      });
-      continue;
+        auto &CalleeTTI = FAM.getResult<TargetIRAnalysis>(*Callee);
+        InlineCost IC = getInlineCost(*CB, Callee, Params, CalleeTTI,
+                                       GetAssumptionCache, GetTLI, GetBFI,
+                                       PSI, nullptr, GetEVC);
+        if (IC.isNever())
+          continue;
+
+        unsigned CalleeSize = Callee->getInstructionCount();
+        int CostDelta;
+        bool Always = false;
+        if (IC.isAlways()) {
+          CostDelta = 100000;
+          Always = true;
+        } else {
+          CostDelta = IC.getCostDelta();
+          if (CostDelta <= 0)
+            continue;
+        }
+
+        // Submodular growth discount: benefit decreases as caller grows.
+        unsigned Growth = GrowthSoFar.lookup(&F);
+        unsigned Budget = GetBudget(&F);
+        float GrowthPressure =
+            1.0f / (1.0f + static_cast<float>(Growth) /
+                               static_cast<float>(std::max(Budget, 1u)));
+        float Benefit = static_cast<float>(CostDelta) * GrowthPressure *
+                        BenefitMultiplier;
+
+        Candidates.push_back(
+            InlineCandidate{CB, &F, Callee, CostDelta, CalleeSize, Always});
+        // Store adjusted benefit in CostDelta for sorting.
+        Candidates.back().CostDelta = static_cast<int>(Benefit);
+      }
+    };
+
+    if (OnlyFunctions) {
+      for (Function *F : *OnlyFunctions)
+        Process(*F);
+    } else {
+      for (Function &F : M)
+        Process(F);
     }
+    return Candidates;
+  };
 
-    // Inline.
-    InlineFunctionInfo IFI(GetAssumptionCache, PSI);
-    InlineResult IR = InlineFunction(*Cand.CB, IFI, /*MergeAttributes=*/true);
-    if (!IR.isSuccess())
-      continue;
+  auto RunGreedy = [&](std::vector<InlineCandidate> &Candidates) -> unsigned {
+    // Sort by adjusted benefit descending.
+    llvm::sort(Candidates, [](const InlineCandidate &A,
+                               const InlineCandidate &B) {
+      return A.CostDelta > B.CostDelta;
+    });
 
-    Changed = true;
-    GrowthSoFar[Cand.Caller] += Cand.CalleeSize;
-    ++NumMatroidInlined;
+    unsigned Inlined = 0;
+    SmallVector<Function *, 16> ModifiedCallers;
 
-    {
-      auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(*Cand.Caller);
-      using namespace ore;
-      ORE.emit([&]() {
-        return OptimizationRemark(DEBUG_TYPE, "Inlined", Cand.Caller)
-               << NV("Callee", Cand.Callee)
-               << " inlined into "
-               << NV("Caller", Cand.Caller)
-               << " (cost delta " << NV("CostDelta", Cand.CostDelta)
-               << ", size " << NV("CalleeSize", Cand.CalleeSize)
-               << ", growth " << NV("Growth", GrowthSoFar[Cand.Caller])
-               << "/" << NV("Budget", Budget) << ")";
-      });
+    for (auto &Cand : Candidates) {
+      if (DeadFunctions.count(Cand.Callee))
+        continue;
+      if (Cand.CB->getCalledFunction() != Cand.Callee)
+        continue;
+
+      unsigned Growth = GrowthSoFar.lookup(Cand.Caller);
+      unsigned Budget = GetBudget(Cand.Caller);
+      if (!Cand.AlwaysInline && Growth + Cand.CalleeSize > Budget) {
+        ++NumMatroidRejected;
+        continue;
+      }
+
+      InlineFunctionInfo IFI(GetAssumptionCache, PSI);
+      InlineResult IR =
+          InlineFunction(*Cand.CB, IFI, /*MergeAttributes=*/true);
+      if (!IR.isSuccess())
+        continue;
+
+      Changed = true;
+      GrowthSoFar[Cand.Caller] += Cand.CalleeSize;
+      ++NumMatroidInlined;
+      ++Inlined;
+
+      // Track modified callers for next round's transitive discovery.
+      ModifiedCallers.push_back(Cand.Caller);
+
+      LLVM_DEBUG(dbgs() << "[MatroidInline] Inlined " << Cand.Callee->getName()
+                        << " into " << Cand.Caller->getName()
+                        << " (delta=" << Cand.CostDelta
+                        << " size=" << Cand.CalleeSize
+                        << " growth=" << GrowthSoFar[Cand.Caller]
+                        << "/" << Budget << ")\n");
+
+      if (Cand.Callee->isDiscardableIfUnused() &&
+          Cand.Callee->hasZeroLiveUses()) {
+        DeadFunctions.insert(Cand.Callee);
+      }
     }
+    return Inlined;
+  };
 
-    LLVM_DEBUG(dbgs() << "[MatroidInline] Inlined " << Cand.Callee->getName()
-                      << " into " << Cand.Caller->getName()
-                      << " (delta=" << Cand.CostDelta
-                      << " size=" << Cand.CalleeSize
-                      << " growth=" << GrowthSoFar[Cand.Caller]
-                      << "/" << Budget << ")\n");
+  // Round 0: All call sites in the module.
+  {
+    auto Candidates = CollectCandidates(nullptr, 1.0f);
+    LLVM_DEBUG(dbgs() << "[MatroidInline] Round 0: " << Candidates.size()
+                      << " candidates\n");
+    RunGreedy(Candidates);
+  }
 
-    // Track dead callees.
-    if (Cand.Callee->isDiscardableIfUnused() &&
-        Cand.Callee->hasZeroLiveUses()) {
-      DeadFunctions.insert(Cand.Callee);
+  // Rounds 1..N: Re-evaluate modified callers for transitive opportunities.
+  // After inlining, the caller has new code that may contain new call sites
+  // worth inlining. This mimics the CGSCC's worklist re-evaluation.
+  for (unsigned Round = 1; Round <= MaxRounds; ++Round) {
+    // Collect only from functions that were modified (grew from inlining).
+    SmallVector<Function *, 16> ModifiedFuncs;
+    for (auto &[F, Growth] : GrowthSoFar) {
+      if (Growth > 0 && !DeadFunctions.count(F))
+        ModifiedFuncs.push_back(F);
     }
+    if (ModifiedFuncs.empty())
+      break;
+
+    float Decay = std::pow(TransitiveDecay, static_cast<float>(Round));
+    auto Candidates = CollectCandidates(&ModifiedFuncs, Decay);
+    if (Candidates.empty())
+      break;
+
+    LLVM_DEBUG(dbgs() << "[MatroidInline] Round " << Round << ": "
+                      << Candidates.size()
+                      << " candidates (decay=" << Decay << ")\n");
+    unsigned NewInlines = RunGreedy(Candidates);
+    if (NewInlines == 0)
+      break;
   }
 
   // Delete dead functions.
