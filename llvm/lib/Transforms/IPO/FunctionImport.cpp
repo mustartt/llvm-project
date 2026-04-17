@@ -46,8 +46,10 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+#include <algorithm>
 #include <cassert>
 #include <memory>
+#include <queue>
 #include <string>
 #include <system_error>
 #include <tuple>
@@ -71,6 +73,14 @@ STATISTIC(NumImportedGlobalVars,
 STATISTIC(NumImportedModules, "Number of modules imported from");
 STATISTIC(NumDeadSymbols, "Number of dead stripped symbols in index");
 STATISTIC(NumLiveSymbols, "Number of live symbols in index");
+STATISTIC(NumMatroidCandidates,
+          "Number of candidate import edges enumerated by matroid optimizer");
+STATISTIC(NumMatroidSelected,
+          "Number of imports selected by matroid greedy");
+STATISTIC(NumMatroidSeeded,
+          "Number of unconditional imports seeded before matroid greedy");
+STATISTIC(NumMatroidTransitive,
+          "Number of transitive imports discovered by matroid optimizer");
 
 namespace llvm {
 cl::opt<bool>
@@ -117,6 +127,39 @@ static cl::opt<float> ImportColdMultiplier(
 
 static cl::opt<bool> PrintImports("print-imports", cl::init(false), cl::Hidden,
                                   cl::desc("Print imported functions"));
+
+static cl::opt<bool> ImportMatroid(
+    "import-matroid", cl::init(false), cl::Hidden,
+    cl::desc("Use matroid-based global optimizer for import decisions"));
+
+static cl::opt<float> ImportMatroidGrowthFactor(
+    "import-matroid-growth-factor", cl::init(3.0), cl::Hidden,
+    cl::value_desc("x"),
+    cl::desc("Per-module import budget as fraction of local instruction count"));
+
+static cl::opt<unsigned> ImportMatroidCalleeBudget(
+    "import-matroid-callee-budget", cl::init(0), cl::Hidden,
+    cl::value_desc("N"),
+    cl::desc("Max total instcount from duplicating a callee across modules "
+             "(0=unlimited). Budget per callee = N / callee_instcount. "
+             "Small functions get more copies, large functions fewer."));
+
+static cl::opt<unsigned> ImportMatroidMaxDepth(
+    "import-matroid-max-depth", cl::init(4), cl::Hidden,
+    cl::value_desc("N"),
+    cl::desc("Maximum transitive import depth for matroid optimizer"));
+
+static cl::opt<float> ImportMatroidDecay(
+    "import-matroid-decay", cl::init(0.7), cl::Hidden,
+    cl::value_desc("x"),
+    cl::desc("Benefit decay factor per transitive import level"));
+
+static cl::opt<unsigned> ImportMatroidICacheSize(
+    "import-matroid-icache-size", cl::init(0), cl::Hidden,
+    cl::value_desc("N"),
+    cl::desc("I-cache capacity in instructions for submodular benefit model "
+             "(0=disabled). When set, benefit diminishes as module import "
+             "volume approaches cache capacity, modeling I-cache pressure."));
 
 static cl::opt<bool> PrintImportFailures(
     "print-import-failures", cl::init(false), cl::Hidden,
@@ -838,6 +881,424 @@ public:
   }
 };
 
+/// A candidate edge for the matroid-based import optimizer.
+struct ImportCandidate {
+  StringRef ImportingModule;
+  GlobalValue::GUID CalleeGUID;
+  ValueInfo CalleeVI;
+  const FunctionSummary *CalleeSummary;
+  StringRef ExportingModule;
+  CalleeInfo::HotnessType Hotness;
+  unsigned InstCount;
+  unsigned NumCallers; // number of distinct callers in ImportingModule
+  float Benefit;
+
+  bool operator<(const ImportCandidate &O) const {
+    return Benefit < O.Benefit; // max-heap: lower benefit = lower priority
+  }
+};
+
+/// Compute the import benefit for a candidate edge. Higher is better.
+///
+/// The benefit function has three components:
+///   1. Hotness weight: from profile data (Critical >> Hot >> None/Unknown >> Cold)
+///   2. Inline likelihood: functions within the import threshold are much more
+///      likely to be inlined by the backend, so they get a large bonus.
+///   3. Size efficiency: prefer smaller functions (less code growth per import).
+///
+/// The combined formula is:
+///   benefit = HotnessWeight * InlineBonus / max(InstCount, 1)
+///
+/// Where InlineBonus = 10 if InstCount <= ImportInstrLimit, 1 otherwise.
+/// This ensures threshold-eligible functions are imported first (matching the
+/// baseline's behavior), while the budget constraint provides the global
+/// optimization that the baseline lacks.
+static float computeMatroidBenefit(CalleeInfo::HotnessType Hotness,
+                                   unsigned InstCount,
+                                   unsigned NumCallers = 1) {
+  float HotnessWeight;
+  switch (Hotness) {
+  case CalleeInfo::HotnessType::Critical:
+    HotnessWeight = 100.0f;
+    break;
+  case CalleeInfo::HotnessType::Hot:
+    HotnessWeight = 10.0f;
+    break;
+  case CalleeInfo::HotnessType::None:
+    HotnessWeight = 1.0f;
+    break;
+  case CalleeInfo::HotnessType::Unknown:
+    HotnessWeight = 1.0f;
+    break;
+  case CalleeInfo::HotnessType::Cold:
+    HotnessWeight = 0.0f;
+    break;
+  }
+  // Functions within the import instruction limit are much more likely to be
+  // inlined by the backend. Give them a 10x bonus to ensure they're imported
+  // before larger functions that probably won't be inlined.
+  float InlineBonus = (InstCount <= ImportInstrLimit) ? 10.0f : 1.0f;
+
+  // Fan-in bonus: if multiple callers in the importing module call this
+  // function, importing it enables more inlining sites. Use sqrt to dampen
+  // the effect (2 callers = 1.4x, 4 callers = 2x, 9 callers = 3x).
+  float FanInBonus = std::sqrt(static_cast<float>(std::max(NumCallers, 1u)));
+
+  return HotnessWeight * InlineBonus * FanInBonus /
+         static_cast<float>(std::max(InstCount, 1u));
+}
+
+/// Resolve the best eligible callee summary for a ValueInfo.
+/// Returns nullptr if no eligible candidate found.
+static const FunctionSummary *resolveBestCallee(
+    const ModuleSummaryIndex &Index, ValueInfo VI, StringRef ImportingModule,
+    function_ref<bool(GlobalValue::GUID, const GlobalValueSummary *)>
+        IsPrevailing) {
+  if (VI.getSummaryList().empty())
+    return nullptr;
+
+  auto Dominated =
+      qualifyCalleeCandidates(Index, VI.getSummaryList(), ImportingModule);
+
+  const FunctionSummary *BestCallee = nullptr;
+  for (auto [Reason, Candidate] : Dominated) {
+    if (Reason != FunctionImporter::ImportFailureReason::None)
+      continue;
+    auto *FS = dyn_cast<FunctionSummary>(Candidate->getBaseObject());
+    if (!FS)
+      continue;
+    if (FS->fflags().NoInline && !ForceImportAll)
+      continue;
+    if (IsPrevailing(VI.getGUID(), Candidate)) {
+      BestCallee = FS;
+      break;
+    }
+    if (!BestCallee)
+      BestCallee = FS;
+  }
+  return BestCallee;
+}
+
+/// Global matroid-based import optimizer. Selects imports across all modules
+/// simultaneously using a partition matroid (per-module code size budgets)
+/// and a greedy algorithm.
+static void computeMatroidImports(
+    const ModuleSummaryIndex &Index,
+    const DenseMap<StringRef, GVSummaryMapTy> &ModuleToDefinedGVSummaries,
+    function_ref<bool(GlobalValue::GUID, const GlobalValueSummary *)>
+        IsPrevailing,
+    FunctionImporter::ImportListsTy &ImportLists,
+    DenseMap<StringRef, FunctionImporter::ExportSetTy> &ExportLists) {
+
+  // Step 1: Initialize per-module budgets.
+  // Budget = local instruction count * growth factor, with a floor of 100.
+  DenseMap<StringRef, unsigned> ModuleBudgets;
+  for (const auto &[ModName, DefinedGVSummaries] : ModuleToDefinedGVSummaries) {
+    unsigned LocalInstCount = 0;
+    for (const auto &[GUID, GVS] : DefinedGVSummaries) {
+      if (auto *FS = dyn_cast<FunctionSummary>(GVS->getBaseObject()))
+        LocalInstCount += FS->instCount();
+    }
+    unsigned Budget = static_cast<unsigned>(
+        static_cast<float>(LocalInstCount) * ImportMatroidGrowthFactor);
+    ModuleBudgets[ModName] = std::max(Budget, 100u);
+    LLVM_DEBUG(dbgs() << "[Matroid] Module '" << ModName
+                      << "' local instcount=" << LocalInstCount
+                      << " budget=" << ModuleBudgets[ModName] << "\n");
+  }
+
+  // Step 2: Walk the cross-module call graph from each module's local
+  // functions via BFS. Record all reachable cross-module functions as
+  // candidates with distance-decayed benefit. This replaces separate
+  // "direct enumeration" and "transitive rounds" with a single unified pass.
+  using CandidateKey = std::pair<StringRef, GlobalValue::GUID>;
+  DenseMap<CandidateKey, ImportCandidate> CandidateMap;
+
+  for (const auto &[ModName, DefinedGVSummaries] : ModuleToDefinedGVSummaries) {
+    // BFS worklist: (FunctionSummary to scan, depth from local function)
+    SmallVector<std::pair<const FunctionSummary *, unsigned>, 64> Worklist;
+    DenseSet<GlobalValue::GUID> Visited; // per-module visited set
+
+    // Seed worklist with locally-defined functions.
+    for (const auto &[GUID, GVS] : DefinedGVSummaries) {
+      if (!Index.isGlobalValueLive(GVS))
+        continue;
+      auto *FS = dyn_cast<FunctionSummary>(GVS->getBaseObject());
+      if (!FS)
+        continue;
+      Worklist.push_back({FS, 0});
+      Visited.insert(GUID);
+    }
+
+    // BFS through the call graph.
+    while (!Worklist.empty()) {
+      auto [CallerFS, Depth] = Worklist.pop_back_val();
+      float DecayFactor =
+          std::pow(static_cast<float>(ImportMatroidDecay), Depth);
+
+      for (const auto &Edge : CallerFS->calls()) {
+        ValueInfo VI = Edge.first;
+
+        // Skip if callee is defined in this module.
+        if (DefinedGVSummaries.count(VI.getGUID()))
+          continue;
+
+        const FunctionSummary *BestCallee =
+            resolveBestCallee(Index, VI, ModName, IsPrevailing);
+        if (!BestCallee)
+          continue;
+
+        auto Hotness = Edge.second.getHotness();
+        unsigned InstCount = BestCallee->instCount();
+        float Benefit =
+            computeMatroidBenefit(Hotness, InstCount, 1) * DecayFactor;
+        if (Benefit <= 0.0f)
+          continue;
+
+        CandidateKey Key{ModName, VI.getGUID()};
+        auto [It, Inserted] = CandidateMap.try_emplace(
+            Key,
+            ImportCandidate{ModName, VI.getGUID(), VI, BestCallee,
+                            BestCallee->modulePath(), Hotness, InstCount,
+                            /*NumCallers=*/1, Benefit});
+        if (!Inserted) {
+          // Seen this callee before via a different path — update.
+          It->second.NumCallers++;
+          if (Benefit > It->second.Benefit)
+            It->second.Benefit = Benefit; // keep highest benefit path
+          if (Hotness > It->second.Hotness) {
+            It->second.Hotness = Hotness;
+            It->second.CalleeSummary = BestCallee;
+            It->second.ExportingModule = BestCallee->modulePath();
+          }
+        }
+
+        // Continue BFS into this callee's callees (if not visited and
+        // within depth limit).
+        if (Visited.insert(VI.getGUID()).second &&
+            Depth + 1 <= ImportMatroidMaxDepth) {
+          Worklist.push_back({BestCallee, Depth + 1});
+        }
+      }
+    }
+  }
+
+  NumMatroidCandidates += CandidateMap.size();
+  LLVM_DEBUG({
+    dbgs() << "[Matroid] Enumerated " << CandidateMap.size()
+           << " candidate import edges\n";
+    for (auto &[Key, C] : CandidateMap) {
+      dbgs() << "[Matroid]   Candidate: " << C.CalleeVI
+             << " into " << C.ImportingModule
+             << " hotness=" << static_cast<int>(C.Hotness)
+             << " instcount=" << C.InstCount
+             << " benefit=" << C.Benefit << "\n";
+    }
+  });
+
+  // Track which (module, callee) pairs are already imported.
+  DenseMap<StringRef, DenseSet<GlobalValue::GUID>> AlreadyImported;
+
+  // Track per-callee duplication count (how many modules imported each callee).
+  // This is the second partition matroid: partition by callee, budget per callee.
+  // Budget scales with callee size: small functions get more copies.
+  DenseMap<GlobalValue::GUID, unsigned> CalleeDuplicationCount;
+
+  // Independence oracle: check both matroid constraints.
+  auto IsIndependent = [&](const ImportCandidate &C) -> bool {
+    // Partition 1: per-module budget (code size growth).
+    if (C.InstCount > ModuleBudgets[C.ImportingModule])
+      return false;
+    // Partition 2: per-callee duplication limit, scaled by size.
+    // Budget = CalleeBudget / instcount — small functions get more copies.
+    if (ImportMatroidCalleeBudget > 0) {
+      unsigned MaxCopies =
+          ImportMatroidCalleeBudget / std::max(C.InstCount, 1u);
+      if (MaxCopies == 0)
+        MaxCopies = 1; // at least 1 copy always allowed
+      if (CalleeDuplicationCount[C.CalleeGUID] >= MaxCopies)
+        return false;
+    }
+    return true;
+  };
+
+  // Helper to commit an import decision.
+  auto CommitImport = [&](const ImportCandidate &C) {
+    ImportLists[C.ImportingModule].addDefinition(C.ExportingModule,
+                                                 C.CalleeGUID);
+    ExportLists[C.ExportingModule].insert(C.CalleeVI);
+    AlreadyImported[C.ImportingModule].insert(C.CalleeGUID);
+    ModuleBudgets[C.ImportingModule] -= C.InstCount;
+    CalleeDuplicationCount[C.CalleeGUID]++;
+
+    if (C.Hotness == CalleeInfo::HotnessType::Hot)
+      ++NumImportedHotFunctionsThinLink;
+    else if (C.Hotness == CalleeInfo::HotnessType::Critical)
+      ++NumImportedCriticalFunctionsThinLink;
+    ++NumImportedFunctionsThinLink;
+  };
+
+  // Step 3: Seed unconditional imports (AlwaysInline and Critical hotness).
+  // These skip the supermodular region where greedy may underperform.
+  std::vector<ImportCandidate> GreedyCandidates;
+  for (auto &[Key, C] : CandidateMap) {
+    bool Unconditional =
+        C.CalleeSummary->fflags().AlwaysInline ||
+        C.Hotness == CalleeInfo::HotnessType::Critical;
+
+    if (!Unconditional) {
+      if (C.Benefit > 0.0f)
+        GreedyCandidates.push_back(C);
+      continue;
+    }
+
+    // Check both matroid constraints before seeding.
+    if (!AlreadyImported[C.ImportingModule].count(C.CalleeGUID)) {
+      if (IsIndependent(C)) {
+        CommitImport(C);
+        ++NumMatroidSeeded;
+        LLVM_DEBUG(dbgs() << "[Matroid] Seeded: " << C.CalleeVI
+                          << " into " << C.ImportingModule
+                          << " (instcount=" << C.InstCount
+                          << " remaining_budget="
+                          << ModuleBudgets[C.ImportingModule] << ")\n");
+      } else {
+        // Over budget even for unconditional — add to greedy to try later
+        // in case budget frees up (it won't, but keeps logic clean).
+        if (C.Benefit > 0.0f)
+          GreedyCandidates.push_back(C);
+      }
+    }
+  }
+
+  LLVM_DEBUG(dbgs() << "[Matroid] Seeded " << NumMatroidSeeded
+                    << " unconditional imports, "
+                    << GreedyCandidates.size()
+                    << " candidates remain for greedy\n");
+
+  // Step 4: Lazy greedy with submodular I-cache pressure model.
+  //
+  // When ImportMatroidICacheSize > 0, the benefit of importing into module M
+  // diminishes as M's total import volume grows:
+  //   effective_benefit(e, S_M) = benefit(e) / (1 + |S_M| / ICacheSize)
+  // where |S_M| is the total instcount already imported into M.
+  //
+  // This is the Minoux (1978) lazy greedy: pop top element, recompute its
+  // benefit with current state, re-insert if it's no longer the best.
+  // Amortized O(n log n) — most elements are re-evaluated only once.
+  //
+  // When ICacheSize=0, the benefit is static (modular) and the greedy is
+  // a standard max-heap pass.
+  {
+    // Track per-module imported instcount for I-cache model.
+    DenseMap<StringRef, unsigned> ModuleImportedInstCount;
+    // Also account for seeded imports.
+    for (auto &[ModName, ImportedGUIDs] : AlreadyImported) {
+      for (GlobalValue::GUID GUID : ImportedGUIDs) {
+        ValueInfo VI = Index.getValueInfo(GUID);
+        if (!VI) continue;
+        for (const auto &S : VI.getSummaryList()) {
+          auto *FS = dyn_cast<FunctionSummary>(S->getBaseObject());
+          if (FS) { ModuleImportedInstCount[ModName] += FS->instCount(); break; }
+        }
+      }
+    }
+
+    std::priority_queue<ImportCandidate> Heap(std::less<ImportCandidate>(),
+                                              std::move(GreedyCandidates));
+    while (!Heap.empty()) {
+      ImportCandidate C = Heap.top();
+      Heap.pop();
+
+      if (AlreadyImported[C.ImportingModule].count(C.CalleeGUID))
+        continue;
+
+      if (!IsIndependent(C))
+        continue;
+
+      // Submodular I-cache pressure: recompute benefit with current state.
+      if (ImportMatroidICacheSize > 0) {
+        unsigned CurrentLoad = ModuleImportedInstCount[C.ImportingModule];
+        float Pressure = 1.0f + static_cast<float>(CurrentLoad) /
+                                    static_cast<float>(ImportMatroidICacheSize);
+        float AdjustedBenefit = C.Benefit / Pressure;
+
+        // Lazy greedy: if adjusted benefit < next element's benefit,
+        // re-insert with updated benefit and try again.
+        if (!Heap.empty() && AdjustedBenefit < Heap.top().Benefit) {
+          C.Benefit = AdjustedBenefit;
+          Heap.push(C);
+          continue;
+        }
+        C.Benefit = AdjustedBenefit;
+      }
+
+      CommitImport(C);
+      ModuleImportedInstCount[C.ImportingModule] += C.InstCount;
+      ++NumMatroidSelected;
+      LLVM_DEBUG(dbgs() << "[Matroid] Greedy selected: " << C.CalleeVI
+                        << " into " << C.ImportingModule
+                        << " (benefit=" << C.Benefit
+                        << " instcount=" << C.InstCount
+                        << " dup_count=" << CalleeDuplicationCount[C.CalleeGUID]
+                        << " remaining_budget="
+                        << ModuleBudgets[C.ImportingModule] << ")\n");
+    }
+  }
+
+  LLVM_DEBUG(dbgs() << "[Matroid] Summary: " << NumMatroidCandidates
+                    << " candidates, " << NumMatroidSeeded << " seeded, "
+                    << NumMatroidSelected << " greedy selected ("
+                    << NumMatroidTransitive << " transitive)\n");
+
+  if (PrintImports) {
+    unsigned TotalImported = 0;
+    for (auto &[ModName, ImportedGUIDs] : AlreadyImported)
+      TotalImported += ImportedGUIDs.size();
+    errs() << "[Matroid] Total: " << CandidateMap.size() << " candidates, "
+           << TotalImported << " imported ("
+           << NumMatroidSeeded << " seeded + "
+           << NumMatroidSelected << " greedy)\n";
+    if (ImportMatroidCalleeBudget > 0) {
+      unsigned Capped = 0, MaxDup = 0;
+      for (auto &[GUID, Count] : CalleeDuplicationCount) {
+        MaxDup = std::max(MaxDup, Count);
+        // Check if this callee hit its size-scaled limit
+        // We don't have instcount here easily, so just report max dup
+      }
+      errs() << "[Matroid] Callee duplication budget=" << ImportMatroidCalleeBudget
+             << " (size-scaled), max duplication=" << MaxDup
+             << " across " << CalleeDuplicationCount.size() << " callees\n";
+    }
+    for (auto &[ModName, Budget] : ModuleBudgets) {
+      auto &Imported = AlreadyImported[ModName];
+      if (!Imported.empty())
+        errs() << "[Matroid]   " << ModName << ": " << Imported.size()
+               << " imports, remaining_budget=" << Budget << "\n";
+    }
+  }
+
+  // Step 5: Import referenced globals for each selected import.
+  for (const auto &[ModName, DefinedGVSummaries] : ModuleToDefinedGVSummaries) {
+    auto &ImportList = ImportLists[ModName];
+    GlobalsImporter GVI(Index, DefinedGVSummaries, IsPrevailing, ImportList,
+                        &ExportLists);
+    auto &Imported = AlreadyImported[ModName];
+    for (GlobalValue::GUID ImportedGUID : Imported) {
+      ValueInfo VI = Index.getValueInfo(ImportedGUID);
+      if (!VI)
+        continue;
+      for (const auto &S : VI.getSummaryList()) {
+        auto *FS = dyn_cast<FunctionSummary>(S->getBaseObject());
+        if (FS && IsPrevailing(ImportedGUID, S.get())) {
+          GVI.onImportingSummary(*FS);
+          break;
+        }
+      }
+    }
+  }
+}
+
 std::unique_ptr<ModuleImportsManager> ModuleImportsManager::create(
     function_ref<bool(GlobalValue::GUID, const GlobalValueSummary *)>
         IsPrevailing,
@@ -1231,14 +1692,23 @@ void llvm::ComputeCrossModuleImport(
         isPrevailing,
     FunctionImporter::ImportListsTy &ImportLists,
     DenseMap<StringRef, FunctionImporter::ExportSetTy> &ExportLists) {
-  auto MIS = ModuleImportsManager::create(isPrevailing, Index, &ExportLists);
-  // For each module that has function defined, compute the import/export lists.
-  for (const auto &DefinedGVSummaries : ModuleToDefinedGVSummaries) {
-    auto &ImportList = ImportLists[DefinedGVSummaries.first];
-    LLVM_DEBUG(dbgs() << "Computing import for Module '"
-                      << DefinedGVSummaries.first << "'\n");
-    MIS->computeImportForModule(DefinedGVSummaries.second,
-                                DefinedGVSummaries.first, ImportList);
+  if (ImportMatroid) {
+    LLVM_DEBUG(dbgs() << "[Matroid] Using matroid-based global import "
+                         "optimizer\n");
+    computeMatroidImports(Index, ModuleToDefinedGVSummaries, isPrevailing,
+                          ImportLists, ExportLists);
+  } else {
+    auto MIS =
+        ModuleImportsManager::create(isPrevailing, Index, &ExportLists);
+    // For each module that has function defined, compute the import/export
+    // lists.
+    for (const auto &DefinedGVSummaries : ModuleToDefinedGVSummaries) {
+      auto &ImportList = ImportLists[DefinedGVSummaries.first];
+      LLVM_DEBUG(dbgs() << "Computing import for Module '"
+                        << DefinedGVSummaries.first << "'\n");
+      MIS->computeImportForModule(DefinedGVSummaries.second,
+                                  DefinedGVSummaries.first, ImportList);
+    }
   }
 
   // When computing imports we only added the variables and functions being
