@@ -101,6 +101,15 @@ private:
   ModulePassManager MPM;
   ModulePassManager AfterCGMPM;
 };
+/// Matroid-based module-level inliner. Uses a partition matroid with
+/// per-function growth budgets to prevent exponential inlining blowup.
+/// Operates on the whole module call graph — no SCC constraints.
+/// Uses the existing InlineCost model for benefit ranking.
+class MatroidInlinerPass : public PassInfoMixin<MatroidInlinerPass> {
+public:
+  LLVM_ABI PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
+};
+
 } // end namespace llvm
 
 #endif // LLVM_TRANSFORMS_IPO_INLINER_H

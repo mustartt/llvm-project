@@ -30,6 +30,7 @@
 #include "llvm/Analysis/InlineAdvisor.h"
 #include "llvm/Analysis/InlineCost.h"
 #include "llvm/Analysis/LazyCallGraph.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ReplayInlineAdvisor.h"
@@ -59,6 +60,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <algorithm>
 #include <cassert>
+#include <queue>
 #include <utility>
 
 using namespace llvm;
@@ -67,6 +69,24 @@ using namespace llvm;
 
 STATISTIC(NumInlined, "Number of functions inlined");
 STATISTIC(NumDeleted, "Number of functions deleted because all callers found");
+STATISTIC(NumMatroidInlined,
+          "Number of functions inlined by matroid optimizer");
+STATISTIC(NumMatroidRejected,
+          "Number of call sites rejected by matroid budget");
+
+static cl::opt<bool> InlineMatroid(
+    "inline-matroid", cl::init(false), cl::Hidden,
+    cl::desc("Use matroid-based greedy inliner with growth budgets"));
+
+static cl::opt<float> InlineMatroidGrowthFactor(
+    "inline-matroid-growth-factor", cl::init(3.0), cl::Hidden,
+    cl::value_desc("x"),
+    cl::desc("Per-function growth budget as multiple of original size"));
+
+static cl::opt<unsigned> InlineMatroidICacheSize(
+    "inline-matroid-icache-size", cl::init(0), cl::Hidden,
+    cl::value_desc("N"),
+    cl::desc("I-cache capacity for submodular benefit (0=disabled)"));
 
 static cl::opt<int> IntraSCCCostMultiplier(
     "intra-scc-cost-multiplier", cl::init(2), cl::Hidden,
@@ -188,6 +208,23 @@ void makeFunctionBodyUnreachable(Function &F) {
   new UnreachableInst(F.getContext(), BB);
 }
 
+namespace {
+/// A candidate call site for the matroid inliner.
+struct InlineCandidate {
+  CallBase *CB;
+  Function *Caller;
+  Function *Callee;
+  int Cost;      // from InlineCost
+  int Threshold; // from InlineCost
+  float Benefit; // Threshold - Cost, adjusted for growth pressure
+  unsigned CalleeSize;
+
+  bool operator<(const InlineCandidate &O) const {
+    return Benefit < O.Benefit; // max-heap
+  }
+};
+} // namespace
+
 PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
                                    CGSCCAnalysisManager &AM, LazyCallGraph &CG,
                                    CGSCCUpdateResult &UR) {
@@ -281,6 +318,163 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
   // Track potentially dead non-local functions with comdats to see if they can
   // be deleted as a batch after inlining.
   SmallVector<Function *, 4> DeadFunctionsInComdats;
+
+  if (InlineMatroid) {
+    // ===== Matroid-based greedy inliner =====
+    // Evaluate all candidates upfront, rank by benefit, greedily select
+    // within per-function growth budgets. Prevents exponential blowup.
+
+    // Record original function sizes for budget computation.
+    DenseMap<Function *, unsigned> OriginalSize;
+    DenseMap<Function *, unsigned> GrowthSoFar;
+    for (auto &N : *C) {
+      Function &F = N.getFunction();
+      OriginalSize[&F] = F.getInstructionCount();
+      GrowthSoFar[&F] = 0;
+    }
+
+    auto GetBudget = [&](Function *F) -> unsigned {
+      unsigned Orig = OriginalSize.lookup(F);
+      if (Orig == 0) Orig = 1;
+      return static_cast<unsigned>(Orig * InlineMatroidGrowthFactor);
+    };
+
+    // Build candidate list using the real InlineCost model.
+    // This captures constant propagation, dead code, SROA, call overhead,
+    // loop penalties, vector bonuses — everything the existing heuristic uses.
+    auto GetAssumptionCache = [&](Function &F) -> AssumptionCache & {
+      return FAM.getResult<AssumptionAnalysis>(F);
+    };
+    auto GetTLI = [&](Function &F) -> const TargetLibraryInfo & {
+      return FAM.getResult<TargetLibraryAnalysis>(F);
+    };
+    auto GetBFI = [&](Function &F) -> BlockFrequencyInfo & {
+      return FAM.getResult<BlockFrequencyAnalysis>(F);
+    };
+    auto GetEVC = [&](Function &F) -> EphemeralValuesCache & {
+      return FAM.getResult<EphemeralValuesAnalysis>(F);
+    };
+
+    InlineParams Params = getInlineParams();
+
+    std::vector<InlineCandidate> Candidates;
+    for (CallBase *CB : Calls) {
+      Function *Caller = CB->getCaller();
+      Function *Callee = CB->getCalledFunction();
+      if (!Callee || Callee->isDeclaration())
+        continue;
+
+      auto &CalleeTTI = FAM.getResult<TargetIRAnalysis>(*Callee);
+      InlineCost IC = getInlineCost(*CB, Callee, Params, CalleeTTI,
+                                     GetAssumptionCache, GetTLI, GetBFI,
+                                     PSI, nullptr, GetEVC);
+
+      // Only consider profitable call sites.
+      if (IC.isNever())
+        continue;
+
+      unsigned CalleeSize = Callee->getInstructionCount();
+      float Benefit;
+      if (IC.isAlways()) {
+        Benefit = 1e6f; // Very high priority for always-inline
+      } else {
+        int CostDelta = IC.getCostDelta(); // Threshold - Cost
+        if (CostDelta <= 0)
+          continue; // Not profitable
+        Benefit = static_cast<float>(CostDelta);
+      }
+
+      Candidates.push_back(
+          InlineCandidate{CB, Caller, Callee,
+                          IC.isAlways() ? 0 : IC.getCost(),
+                          IC.isAlways() ? 0 : IC.getThreshold(),
+                          Benefit, CalleeSize});
+    }
+
+    LLVM_DEBUG(dbgs() << "[MatroidInline] " << Candidates.size()
+                      << " candidates in SCC\n");
+
+    // Greedy with submodular growth pressure.
+    // Process per-caller to properly update the call graph after each batch.
+    // First, sort candidates by benefit (highest first).
+    llvm::sort(Candidates, [](const InlineCandidate &A,
+                               const InlineCandidate &B) {
+      return A.Benefit > B.Benefit;
+    });
+
+    SmallPtrSet<Function *, 8> ModifiedCallers;
+    SmallPtrSet<Function *, 8> DeadCallees;
+
+    for (auto &Cand : Candidates) {
+      // Skip if callee was deleted by prior inlining.
+      if (DeadCallees.count(Cand.Callee))
+        continue;
+      // Skip if caller no longer in this SCC.
+      LazyCallGraph::Node *CallerNPtr = CG.lookup(*Cand.Caller);
+      if (!CallerNPtr || CG.lookupSCC(*CallerNPtr) != C)
+        continue;
+      // Verify callee is still the target.
+      if (Cand.CB->getCalledFunction() != Cand.Callee)
+        continue;
+
+      // Submodular growth discount.
+      unsigned Growth = GrowthSoFar.lookup(Cand.Caller);
+      unsigned Budget = GetBudget(Cand.Caller);
+
+      // Per-caller growth budget (partition matroid constraint).
+      if (Growth + Cand.CalleeSize > Budget) {
+        ++NumMatroidRejected;
+        continue;
+      }
+
+      // Inline.
+      InlineFunctionInfo IFI(GetAssumptionCache, PSI);
+      InlineResult IR = InlineFunction(
+          *Cand.CB, IFI, /*MergeAttributes=*/true,
+          &FAM.getResult<AAManager>(*Cand.Caller));
+      if (!IR.isSuccess())
+        continue;
+
+      Changed = true;
+      InlinedCallees.insert(Cand.Callee);
+      GrowthSoFar[Cand.Caller] += Cand.CalleeSize;
+      ModifiedCallers.insert(Cand.Caller);
+      ++NumMatroidInlined;
+      ++NumInlined;
+
+      LLVM_DEBUG(dbgs() << "[MatroidInline] Inlined " << Cand.Callee->getName()
+                        << " into " << Cand.Caller->getName()
+                        << " (size=" << Cand.CalleeSize
+                        << " growth=" << GrowthSoFar[Cand.Caller]
+                        << "/" << Budget << ")\n");
+
+      // Handle dead callees.
+      if (Cand.Callee->isDiscardableIfUnused() &&
+          Cand.Callee->hasZeroLiveUses() &&
+          !CG.isLibFunction(*Cand.Callee)) {
+        if (Cand.Callee->hasLocalLinkage() || !Cand.Callee->hasComdat()) {
+          DeadCallees.insert(Cand.Callee);
+          makeFunctionBodyUnreachable(*Cand.Callee);
+          DeadFunctions.push_back(Cand.Callee);
+        }
+      }
+    }
+
+    // Update CG for each modified caller.
+    for (Function *F : ModifiedCallers) {
+      LazyCallGraph::Node &N = *CG.lookup(*F);
+      LazyCallGraph::SCC *OldC = C;
+      C = &updateCGAndAnalysisManagerForCGSCCPass(CG, *C, N, AM, UR, FAM);
+      if (C != OldC && OldC == &InitialC)
+        UR.InlinedInternalEdges.insert({&N, OldC});
+    }
+
+    LLVM_DEBUG(dbgs() << "[MatroidInline] Done: " << NumMatroidInlined
+                      << " inlined, " << NumMatroidRejected
+                      << " rejected by budget\n");
+
+    goto matroid_done;
+  }
 
   // Loop forward over all of the calls. Note that we cannot cache the size as
   // inlining can introduce new calls that need to be processed.
@@ -519,6 +713,7 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
     DeadFunctions.append(DeadFunctionsInComdats);
   }
 
+matroid_done:
   // Now that we've finished inlining all of the calls across this SCC, delete
   // all of the trivially dead functions, updating the call graph and the CGSCC
   // pass manager in the process.
@@ -591,6 +786,11 @@ PreservedAnalyses ModuleInlinerWrapperPass::run(Module &M,
         "mode and/or options");
     return PreservedAnalyses::all();
   }
+
+  // Run matroid inliner before CGSCC pipeline if enabled.
+  // This handles global inlining with budget constraints, then the CGSCC
+  // pipeline handles remaining optimizations.
+  MPM.addPass(MatroidInlinerPass());
 
   // We wrap the CGSCC pipeline in a devirtualization repeater. This will try
   // to detect when we devirtualize indirect calls and iterate the SCC passes

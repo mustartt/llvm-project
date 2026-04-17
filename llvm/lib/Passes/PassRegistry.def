@@ -95,6 +95,7 @@ MODULE_PASS("inliner-ml-advisor-release",
             ModuleInlinerWrapperPass(getInlineParams(), true, {},
                                      InliningAdvisorMode::Release, 0))
 MODULE_PASS("inliner-wrapper", ModuleInlinerWrapperPass())
+MODULE_PASS("matroid-inline", MatroidInlinerPass())
 MODULE_PASS("inliner-wrapper-no-mandatory-first",
             ModuleInlinerWrapperPass(getInlineParams(), false))
 MODULE_PASS("insert-gcov-profiling", GCOVProfilerPass())
