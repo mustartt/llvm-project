@@ -20,6 +20,7 @@
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/EphemeralValuesCache.h"
 #include "llvm/Analysis/InlineCost.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -31,7 +32,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include <algorithm>
 
 using namespace llvm;
 
@@ -48,6 +48,12 @@ static cl::opt<bool> EnableMatroidInliner(
 static cl::opt<float> MatroidGrowthFactor(
     "matroid-inline-growth", cl::init(3.0), cl::Hidden, cl::value_desc("x"),
     cl::desc("Per-function growth budget as multiple of original size"));
+
+static cl::opt<int> MatroidInlineThreshold(
+    "matroid-inline-threshold", cl::init(225), cl::Hidden, cl::value_desc("N"),
+    cl::desc("Inline cost threshold for matroid inliner (independent of "
+             "-inline-threshold). Use to keep matroid decisions stable when "
+             "adjusting the CGSCC threshold."));
 
 namespace {
 struct InlineCandidate {
@@ -67,7 +73,10 @@ PreservedAnalyses MatroidInlinerPass::run(Module &M,
 
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   auto *PSI = MAM.getCachedResult<ProfileSummaryAnalysis>(M);
+
+  // Use our own threshold, independent of -inline-threshold.
   InlineParams Params = getInlineParams();
+  Params.DefaultThreshold = MatroidInlineThreshold;
 
   auto GetAssumptionCache = [&](Function &F) -> AssumptionCache & {
     return FAM.getResult<AssumptionAnalysis>(F);
@@ -161,6 +170,17 @@ PreservedAnalyses MatroidInlinerPass::run(Module &M,
     unsigned Budget = GetBudget(Cand.Caller);
     if (!Cand.AlwaysInline && Growth + Cand.CalleeSize > Budget) {
       ++NumMatroidRejected;
+      auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(*Cand.Caller);
+      using namespace ore;
+      ORE.emit([&]() {
+        return OptimizationRemarkMissed(DEBUG_TYPE, "BudgetExceeded", Cand.CB)
+               << NV("Callee", Cand.Callee)
+               << " not inlined into "
+               << NV("Caller", Cand.Caller)
+               << " (growth " << NV("Growth", Growth)
+               << " + " << NV("CalleeSize", Cand.CalleeSize)
+               << " exceeds budget " << NV("Budget", Budget) << ")";
+      });
       continue;
     }
 
@@ -173,6 +193,21 @@ PreservedAnalyses MatroidInlinerPass::run(Module &M,
     Changed = true;
     GrowthSoFar[Cand.Caller] += Cand.CalleeSize;
     ++NumMatroidInlined;
+
+    {
+      auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(*Cand.Caller);
+      using namespace ore;
+      ORE.emit([&]() {
+        return OptimizationRemark(DEBUG_TYPE, "Inlined", Cand.Caller)
+               << NV("Callee", Cand.Callee)
+               << " inlined into "
+               << NV("Caller", Cand.Caller)
+               << " (cost delta " << NV("CostDelta", Cand.CostDelta)
+               << ", size " << NV("CalleeSize", Cand.CalleeSize)
+               << ", growth " << NV("Growth", GrowthSoFar[Cand.Caller])
+               << "/" << NV("Budget", Budget) << ")";
+      });
+    }
 
     LLVM_DEBUG(dbgs() << "[MatroidInline] Inlined " << Cand.Callee->getName()
                       << " into " << Cand.Caller->getName()
