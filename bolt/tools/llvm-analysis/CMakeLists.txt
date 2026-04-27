@@ -13,6 +13,7 @@ set(LLVM_LINK_COMPONENTS
 
 add_bolt_tool(llvm-analysis
   llvm-analysis.cpp
+  CallGraph.cpp
   Symbolizer.cpp
   DISABLE_LLVM_LINK_LLVM_DYLIB
   )
