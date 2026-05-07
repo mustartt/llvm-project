@@ -5235,6 +5235,9 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
+  if (IsMatch && opts::ContextLines > 0 && opts::OutputLevel < opts::OM_Detailed)
+    opts::OutputLevel = opts::OM_Detailed;
+
   // Use BinaryAnalysisMode so run() returns after CFG building without
   // attempting to rewrite the binary.
   opts::BinaryAnalysisMode = true;
