@@ -1169,6 +1169,12 @@ static void cloneInstructionsIntoPredecessorBlockAndUpdateSSAUses(
     if (BonusInst.isTerminator())
       continue;
 
+    // Don't hoist pseudo probes into the predecessor: they would then fire
+    // unconditionally and skew sample counts. Leave them in BB so they get
+    // dropped together with BB when it becomes unreachable.
+    if (match(&BonusInst, m_Intrinsic<Intrinsic::pseudoprobe>()))
+      continue;
+
     Instruction *NewBonusInst = BonusInst.clone();
 
     if (!NewBonusInst->getDebugLoc().isSameSourceLocation(PTI->getDebugLoc())) {
@@ -4151,6 +4157,12 @@ bool llvm::foldBranchToCommonDest(CondBrInst *BI, DomTreeUpdater *DTU,
       continue;
     // Ignore the terminator.
     if (isa<UncondBrInst, CondBrInst>(I))
+      continue;
+    // Pseudo probes are sampling markers; they are not real bonus
+    // instructions and will be left in BB (which becomes unreachable after
+    // the fold). Allowing them through here keeps the chained-branch fold
+    // from being blocked by sample-PGO instrumentation.
+    if (match(&I, m_Intrinsic<Intrinsic::pseudoprobe>()))
       continue;
     // I must be safe to execute unconditionally.
     if (!isSafeToSpeculativelyExecute(&I))
