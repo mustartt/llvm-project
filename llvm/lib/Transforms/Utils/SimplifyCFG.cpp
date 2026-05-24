@@ -1519,6 +1519,11 @@ enum SkipFlags {
 };
 
 static unsigned skippedInstrFlags(Instruction *I) {
+  // Pseudo probes are sampling markers; their inaccessiblemem writes can't
+  // alias program memory and they always transfer control, so skipping past
+  // one should not constrain reordering of surrounding instructions.
+  if (match(I, m_Intrinsic<Intrinsic::pseudoprobe>()))
+    return 0;
   unsigned Flags = 0;
   if (I->mayReadFromMemory())
     Flags |= SkipReadMem;
