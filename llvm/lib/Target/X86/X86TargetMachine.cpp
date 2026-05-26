@@ -636,6 +636,10 @@ void X86PassConfig::addPreEmitPass2() {
   // after all real instructions have been added to the epilog.
   if (TT.isOSWindows() && TT.isX86_64())
     addPass(createX86WinEHUnwindV2LegacyPass());
+
+  // Verify pseudo probe annotations as the very last step so the IR seen
+  // matches what the assembler will emit.
+  addPass(createPseudoProbeVerifier());
 }
 
 bool X86PassConfig::addPostFastRegAllocRewrite() {

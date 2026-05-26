@@ -933,6 +933,10 @@ void AArch64PassConfig::addPreEmitPass2() {
   // SVE bundles move prefixes with destructive operations. BLR_RVMARKER pseudo
   // instructions are lowered to bundles as well.
   addPass(createUnpackMachineBundlesLegacy(nullptr));
+
+  // Verify pseudo probe annotations as the very last step so the IR seen
+  // matches what the assembler will emit.
+  addPass(createPseudoProbeVerifier());
 }
 
 bool AArch64PassConfig::addRegAssignAndRewriteOptimized() {

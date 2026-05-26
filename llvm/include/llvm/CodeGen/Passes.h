@@ -581,6 +581,9 @@ LLVM_ABI FunctionPass *createHardwareLoopsLegacyPass();
 /// This pass inserts pseudo probe annotation for callsite profiling.
 LLVM_ABI FunctionPass *createPseudoProbeInserter();
 
+/// This pass verifies pseudo probe annotations late in the pipeline.
+LLVM_ABI FunctionPass *createPseudoProbeVerifier();
+
 /// Create IR Type Promotion pass. \see TypePromotion.cpp
 LLVM_ABI FunctionPass *createTypePromotionLegacyPass();
 

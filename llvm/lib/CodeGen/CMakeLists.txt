@@ -179,6 +179,7 @@ add_llvm_component_library(LLVMCodeGen
   ProcessImplicitDefs.cpp
   PrologEpilogInserter.cpp
   PseudoProbeInserter.cpp
+  PseudoProbeVerifier.cpp
   PseudoSourceValue.cpp
   RDFGraph.cpp
   RDFLiveness.cpp
