@@ -1121,6 +1121,15 @@ static cl::opt<RegisterRegAlloc::FunctionPassCtor, false,
 void TargetPassConfig::addMachinePasses() {
   AddingMachinePasses = true;
 
+  // Insert MachineBlock pseudo probes at every MBB entry as the very first
+  // MIR pass, before any transformation that could alter MBB structure. This
+  // anchors MBB identity for cross-build profile correlation: the post-ISel
+  // CFG is a function of source + IR-opt + ISel only, none of which are
+  // profile-driven, so probe IDs are stable across iterative profile builds.
+  // The pass is itself gated on -enable-machine-block-probes plus the
+  // pseudo_probe_desc metadata, so this addPass is cheap when disabled.
+  addPass(createMachineBlockProbeInserter());
+
   // Add passes that optimize machine instructions in SSA form.
   if (getOptLevel() != CodeGenOptLevel::None) {
     addMachineSSAOptimization();
@@ -1568,6 +1577,11 @@ void TargetPassConfig::addBlockPlacement() {
                                          sampleprof::FSDiscriminatorPass::Pass2,
                                          nullptr));
   }
+  // Apply a MachineBlock-keyed edge-frequency profile (if one was supplied
+  // via -machine-block-profile-file) immediately before MBP, so MBP and
+  // its companion late-tail-dup decisions consume probe-derived succ
+  // probabilities. The pass is a no-op when the flag is empty.
+  addPass(createMachineBlockProfileLoader());
   if (addPass(&MachineBlockPlacementID)) {
     // Run a separate pass to collect block placement statistics.
     if (EnableBlockPlacementStats)

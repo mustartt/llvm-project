@@ -180,6 +180,8 @@ add_llvm_component_library(LLVMCodeGen
   PrologEpilogInserter.cpp
   PseudoProbeInserter.cpp
   PseudoProbeVerifier.cpp
+  MachineBlockProbeInserter.cpp
+  MachineBlockProfileLoader.cpp
   PseudoSourceValue.cpp
   RDFGraph.cpp
   RDFLiveness.cpp

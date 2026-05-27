@@ -581,6 +581,13 @@ LLVM_ABI FunctionPass *createHardwareLoopsLegacyPass();
 /// This pass inserts pseudo probe annotation for callsite profiling.
 LLVM_ABI FunctionPass *createPseudoProbeInserter();
 
+/// This pass inserts MachineBlock pseudo probes at the entry of every MBB.
+LLVM_ABI FunctionPass *createMachineBlockProbeInserter();
+
+/// This pass loads a MachineBlock-keyed text profile and applies it as
+/// MBB successor probabilities.
+LLVM_ABI FunctionPass *createMachineBlockProfileLoader();
+
 /// This pass verifies pseudo probe annotations late in the pipeline.
 LLVM_ABI FunctionPass *createPseudoProbeVerifier();
 

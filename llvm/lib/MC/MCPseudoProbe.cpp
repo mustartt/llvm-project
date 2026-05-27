@@ -310,8 +310,8 @@ std::string MCDecodedPseudoProbe::getInlineContextStr(
   return OContextStr.str();
 }
 
-static const char *PseudoProbeTypeStr[3] = {"Block", "IndirectCall",
-                                            "DirectCall"};
+static const char *PseudoProbeTypeStr[4] = {"Block", "IndirectCall",
+                                            "DirectCall", "MachineBlock"};
 
 void MCDecodedPseudoProbe::print(raw_ostream &OS,
                                  const GUIDProbeFunctionMap &GUID2FuncMAP,

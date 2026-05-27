@@ -25,9 +25,25 @@ class Instruction;
 
 constexpr const char *PseudoProbeDescMetadataName = "llvm.pseudo_probe_desc";
 
+// Per-function descriptor for MachineBlock probes: (GUID, MIR-CFG hash,
+// FuncName). Parallel to PseudoProbeDescMetadataName but indexed by the
+// MIR-level CFG so that staleness checks distinguish source-equivalent
+// builds whose post-ISel MBB structure differs.
+constexpr const char *MachinePseudoProbeDescMetadataName =
+    "llvm.machine_pseudo_probe_desc";
+
 enum class PseudoProbeReservedId { Invalid = 0, Last = Invalid };
 
-enum class PseudoProbeType { Block = 0, IndirectCall, DirectCall };
+enum class PseudoProbeType {
+  Block = 0,
+  IndirectCall,
+  DirectCall,
+  // A probe placed at the entry of a MachineBasicBlock by a post-ISel
+  // pass. Distinct from Block (which is at IR-BB granularity) so that
+  // consumers can dispatch unambiguously between IR-level and MIR-level
+  // anchors.
+  MachineBlock,
+};
 
 enum class PseudoProbeAttributes {
   Reserved = 0x1,

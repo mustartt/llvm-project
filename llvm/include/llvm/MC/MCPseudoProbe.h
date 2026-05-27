@@ -27,7 +27,8 @@
 //        A list of NPROBES entries. Each entry contains:
 //          INDEX (ULEB128)
 //          TYPE (uint4)
-//            0 - block probe, 1 - indirect call, 2 - direct call
+//            0 - block probe, 1 - indirect call, 2 - direct call,
+//            3 - machine block probe (post-ISel MBB anchor)
 //          ATTRIBUTE (uint3)
 //            1 - reserved
 //            2 - Sentinel
@@ -155,6 +156,13 @@ public:
   }
 
   bool isCall() const { return isIndirectCall() || isDirectCall(); }
+
+  bool isMachineBlock() const {
+    return Type == static_cast<uint8_t>(PseudoProbeType::MachineBlock);
+  }
+
+  // True for any probe that anchors a basic-block-like unit (IR BB or MBB).
+  bool isAnyBlock() const { return isBlock() || isMachineBlock(); }
 
   void setAttributes(uint8_t Attr) { Attributes = Attr; }
 };
