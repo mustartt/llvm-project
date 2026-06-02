@@ -556,6 +556,11 @@ CodeGenModule::CodeGenModule(ASTContext &C,
         break;
       }
     ModuleNameHash = llvm::getUniqueInternalLinkagePostfix(Path);
+    // Signal late codegen passes (e.g. MachineOutliner) that any
+    // internal-linkage symbols they synthesize should also carry a per-module
+    // unique suffix derived from the source file name.
+    getModule().addModuleFlag(llvm::Module::Error,
+                              "unique-internal-linkage-names", 1);
   }
 
   // Record mregparm value now so it is visible through all of codegen.

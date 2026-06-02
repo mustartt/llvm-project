@@ -77,6 +77,7 @@
 #include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/ProfileData/SampleProf.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/SuffixTree.h"
@@ -911,6 +912,14 @@ MachineFunction *MachineOutliner::createOutlinedFunction(
   if (OutlineRepeatedNum > 0)
     FunctionName += std::to_string(OutlineRepeatedNum + 1) + "_";
   FunctionName += std::to_string(Name);
+
+  // If the module was compiled with -funique-internal-linkage-names, append a
+  // per-module unique suffix derived from the source file name so that
+  // outlined functions don't collide across translation units.
+  if (M.getModuleFlag("unique-internal-linkage-names") &&
+      !M.getSourceFileName().empty())
+    FunctionName += getUniqueInternalLinkagePostfix(M.getSourceFileName());
+
   LLVM_DEBUG(dbgs() << "NEW FUNCTION: " << FunctionName << "\n");
 
   // Create the function using an IR-level function.
