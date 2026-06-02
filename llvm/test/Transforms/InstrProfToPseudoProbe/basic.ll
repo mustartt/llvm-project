@@ -40,7 +40,9 @@ nonneg:
 
 define i32 @sum_to(i32 %n) !dbg !7 {
 ; CHECK-LABEL: define i32 @sum_to(
-;; instrprof.cover gets rewritten the same way as instrprof.increment.
+;; instrprof.cover and instrprof.increment.step get rewritten the same way
+;; as instrprof.increment. The step value on increment.step is dropped --
+;; coverage only needs to know the region executed.
 ; CHECK:         call void @llvm.pseudoprobe(i64 [[SUM_GUID:-?[0-9]+]], i64 1, i32 0, i64 -1)
 ; CHECK:         call void @llvm.pseudoprobe(i64 [[SUM_GUID]], i64 2, i32 0, i64 -1)
 entry:
@@ -48,7 +50,7 @@ entry:
   br label %loop
 
 loop:
-  call void @llvm.instrprof.increment(ptr @__profn_sum_to, i64 5678, i32 2, i32 1), !dbg !14
+  call void @llvm.instrprof.increment.step(ptr @__profn_sum_to, i64 5678, i32 2, i32 1, i64 7), !dbg !14
   ret i32 %n
 }
 
@@ -59,6 +61,7 @@ loop:
 ; CHECK-DAG: ![[SUM_DESC]] = !{i64 [[SUM_GUID]], i64 5678, !"sum_to"}
 
 declare void @llvm.instrprof.increment(ptr, i64, i32, i32)
+declare void @llvm.instrprof.increment.step(ptr, i64, i32, i32, i64)
 declare void @llvm.instrprof.cover(ptr, i64, i32, i32)
 
 !llvm.dbg.cu = !{!0}

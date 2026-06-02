@@ -93,10 +93,14 @@ bool rewriteFunction(Function &F, uint64_t &FunctionHash,
 
       switch (Callee->getIntrinsicID()) {
       case Intrinsic::instrprof_increment:
+      case Intrinsic::instrprof_increment_step:
       case Intrinsic::instrprof_cover:
+        // increment_step carries an extra step value used to count loop
+        // iterations. For coverage we only care whether the region executed,
+        // so the step is dropped and the call is rewritten the same way as
+        // a plain increment.
         ToErase.push_back(Call);
         break;
-      case Intrinsic::instrprof_increment_step:
       case Intrinsic::instrprof_callsite:
       case Intrinsic::instrprof_timestamp:
       case Intrinsic::instrprof_value_profile:
@@ -105,7 +109,7 @@ bool rewriteFunction(Function &F, uint64_t &FunctionHash,
         report_fatal_error(
             "InstrProfToPseudoProbe: unexpected instrprof intrinsic; "
             "-fcoverage-via-pseudo-probe should not emit value-profile, "
-            "MCDC, callsite, timestamp, or stepped-increment intrinsics");
+            "MCDC, callsite, or timestamp intrinsics");
       default:
         break;
       }
