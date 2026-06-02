@@ -44,7 +44,8 @@ void CodeGenPGO::setFuncName(StringRef Name,
       PGOReader ? PGOReader->getVersion() : llvm::IndexedInstrProf::Version);
 
   // If we're generating a profile, create a variable for the name.
-  if (CGM.getCodeGenOpts().hasProfileClangInstr())
+  if (CGM.getCodeGenOpts().hasProfileClangInstr() ||
+      CGM.getCodeGenOpts().CoverageViaPseudoProbe)
     FuncNameVar = llvm::createPGOFuncNameVar(CGM.getModule(), Linkage, FuncName);
 }
 
@@ -929,7 +930,8 @@ void CodeGenPGO::assignRegionCounters(GlobalDecl GD, llvm::Function *Fn) {
       D->hasAttr<CUDAGlobalAttr>())
     return;
 
-  bool InstrumentRegions = CGM.getCodeGenOpts().hasProfileClangInstr();
+  bool InstrumentRegions = CGM.getCodeGenOpts().hasProfileClangInstr() ||
+                           CGM.getCodeGenOpts().CoverageViaPseudoProbe;
   llvm::IndexedInstrProfReader *PGOReader = CGM.getPGOReader();
   if (!InstrumentRegions && !PGOReader)
     return;
@@ -1477,7 +1479,8 @@ CodeGenFunction::createProfileWeightsForLoop(const Stmt *Cond,
 void CodeGenFunction::incrementProfileCounter(CounterForIncrement ExecSkip,
                                               const Stmt *S, bool UseBoth,
                                               llvm::Value *StepV) {
-  if (CGM.getCodeGenOpts().hasProfileClangInstr() &&
+  if ((CGM.getCodeGenOpts().hasProfileClangInstr() ||
+       CGM.getCodeGenOpts().CoverageViaPseudoProbe) &&
       !CurFn->hasFnAttribute(llvm::Attribute::NoProfile) &&
       !CurFn->hasFnAttribute(llvm::Attribute::SkipProfile)) {
     auto AL = ApplyDebugLocation::CreateArtificial(*this);

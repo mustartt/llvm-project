@@ -1850,6 +1850,13 @@ defm coverage_mapping : BoolFOption<"coverage-mapping",
           "Generate coverage mapping to enable code coverage analysis">,
   NegFlag<SetFalse, [], [ClangOption], "Disable code coverage analysis">, BothFlags<
           [], [ClangOption, CLOption]>>;
+defm coverage_via_pseudo_probe : BoolFOption<"coverage-via-pseudo-probe",
+  CodeGenOpts<"CoverageViaPseudoProbe">, DefaultFalse,
+  PosFlag<SetTrue, [], [ClangOption, CC1Option],
+          "Emit coverage mapping with counter increments lowered to "
+          "llvm.pseudoprobe; implies -fcoverage-mapping and does not link "
+          "the InstrProf runtime">,
+  NegFlag<SetFalse, [], [ClangOption], "Use the InstrProf runtime for coverage">>;
 defm mcdc_coverage : BoolFOption<"coverage-mcdc",
   CodeGenOpts<"MCDCCoverage">, DefaultFalse,
   PosFlag<SetTrue, [], [ClangOption, CC1Option],

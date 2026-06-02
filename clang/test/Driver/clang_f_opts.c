@@ -127,7 +127,7 @@
 // CHECK-NO-MIX-GENERATE: '{{[a-z=-]*}}' not allowed with '{{[a-z=-]*}}'
 // CHECK-DISABLE-GEN-NOT: "-fprofile-instrument=clang"
 // CHECK-DISABLE-USE-NOT: "-fprofile-instr-use"
-// CHECK-COVERAGE-AND-GEN: '-fcoverage-mapping' only allowed with '-fprofile-instr-generate'
+// CHECK-COVERAGE-AND-GEN: '-fcoverage-mapping' only allowed with '-fprofile-instr-generate or -fcoverage-via-pseudo-probe'
 // CHECK-DISABLE-COVERAGE-NOT: "-fcoverage-mapping"
 // CHECK-PROFILE-REMAP: "-fprofile-remapping-file=foo/bar.txt"
 

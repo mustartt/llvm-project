@@ -1841,6 +1841,12 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
 #include "clang/Options/Options.inc"
 #undef CODEGEN_OPTION_WITH_MARSHALLING
 
+  // -fcoverage-via-pseudo-probe is meaningless without the coverage mapping
+  // table, so force it on. The driver also implies it, but apply the same
+  // rule here so direct -cc1 invocations behave consistently.
+  if (Opts.CoverageViaPseudoProbe)
+    Opts.CoverageMapping = true;
+
   // At O0 we want to fully disable inlining outside of cases marked with
   // 'alwaysinline' that are required for correctness.
   if (Opts.OptimizationLevel == 0) {

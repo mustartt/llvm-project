@@ -538,12 +538,31 @@ static void addPGOAndCoverageFlags(const ToolChain &TC, Compilation &C,
                       Args.hasArg(options::OPT_coverage);
   bool EmitCovData = TC.needsGCovInstrumentation(Args);
 
+  bool CoverageViaPseudoProbe =
+      Args.hasFlag(options::OPT_fcoverage_via_pseudo_probe,
+                   options::OPT_fno_coverage_via_pseudo_probe, false);
+  if (CoverageViaPseudoProbe) {
+    if (ProfileGenerateArg)
+      D.Diag(clang::diag::err_drv_argument_not_allowed_with)
+          << "-fcoverage-via-pseudo-probe"
+          << ProfileGenerateArg->getSpelling();
+    if (PGOGenerateArg)
+      D.Diag(clang::diag::err_drv_argument_not_allowed_with)
+          << "-fcoverage-via-pseudo-probe" << PGOGenerateArg->getSpelling();
+    if (Args.hasFlag(options::OPT_fmcdc_coverage,
+                     options::OPT_fno_mcdc_coverage, false))
+      D.Diag(clang::diag::err_drv_argument_not_allowed_with)
+          << "-fcoverage-via-pseudo-probe" << "-fcoverage-mcdc";
+    CmdArgs.push_back("-fcoverage-via-pseudo-probe");
+  }
+
   if (Args.hasFlag(options::OPT_fcoverage_mapping,
-                   options::OPT_fno_coverage_mapping, false)) {
-    if (!ProfileGenerateArg)
+                   options::OPT_fno_coverage_mapping, false) ||
+      CoverageViaPseudoProbe) {
+    if (!ProfileGenerateArg && !CoverageViaPseudoProbe)
       D.Diag(clang::diag::err_drv_argument_only_allowed_with)
           << "-fcoverage-mapping"
-          << "-fprofile-instr-generate";
+          << "-fprofile-instr-generate or -fcoverage-via-pseudo-probe";
 
     CmdArgs.push_back("-fcoverage-mapping");
   }
