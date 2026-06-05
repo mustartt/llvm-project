@@ -1,0 +1,64 @@
+# RUN: llc -mtriple=aarch64 -run-pass=machine-sink -o - %s | FileCheck %s --check-prefix=OFF
+# RUN: llc -mtriple=aarch64 -run-pass=machine-sink -machine-sink-diamond-loads \
+# RUN:   -machine-sink-diamond-loads-force -o - %s | FileCheck %s --check-prefix=ON
+
+# A load in bb.1 whose result is consumed by both successors (bb.2 and bb.3)
+# cannot be moved by ordinary sinking (there is no single sink target). With
+# -machine-sink-diamond-loads it is cloned into each using successor and the
+# dominating copy is erased, shortening its live range across the branch. This
+# test exercises the mechanics with -...-force (profitability heuristics off).
+
+--- |
+  define double @diamond(ptr %p, i32 %c) { ret double 0.000000e+00 }
+...
+---
+name:            diamond
+tracksRegLiveness: true
+body:             |
+  ; OFF-LABEL: name: diamond
+  ; OFF:      bb.1:
+  ; OFF:        %2:fpr64 = LDRDui %0, 0
+  ; OFF:      bb.2:
+  ; OFF-NOT:     LDRDui
+  ; OFF:        FADDDrr %2, %2
+  ; OFF:      bb.3:
+  ; OFF-NOT:     LDRDui
+  ; OFF:        FMULDrr %2, %2
+  ;
+  ; ON-LABEL: name: diamond
+  ; ON:      bb.1:
+  ; ON-NOT:    LDRDui
+  ; ON:      bb.2:
+  ; ON:        [[L1:%[0-9]+]]:fpr64 = LDRDui %0, 0
+  ; ON:        FADDDrr [[L1]], [[L1]]
+  ; ON:      bb.3:
+  ; ON:        [[L2:%[0-9]+]]:fpr64 = LDRDui %0, 0
+  ; ON:        FMULDrr [[L2]], [[L2]]
+  bb.0:
+    successors: %bb.1(0x80000000)
+    liveins: $x0, $w1
+    %0:gpr64sp = COPY $x0
+    %1:gpr32 = COPY $w1
+    B %bb.1
+
+  bb.1:
+    successors: %bb.2(0x40000000), %bb.3(0x40000000)
+    %2:fpr64 = LDRDui %0, 0 :: (load (s64))
+    CBZW %1, %bb.3
+    B %bb.2
+
+  bb.2:
+    successors: %bb.4(0x80000000)
+    %3:fpr64 = nofpexcept FADDDrr %2, %2, implicit $fpcr
+    B %bb.4
+
+  bb.3:
+    successors: %bb.4(0x80000000)
+    %4:fpr64 = nofpexcept FMULDrr %2, %2, implicit $fpcr
+    B %bb.4
+
+  bb.4:
+    %5:fpr64 = PHI %3, %bb.2, %4, %bb.3
+    $d0 = COPY %5
+    RET_ReallyLR implicit $d0
+...

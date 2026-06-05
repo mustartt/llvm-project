@@ -113,7 +113,49 @@ static cl::opt<unsigned> SinkIntoCycleLimit(
         "The maximum number of instructions considered for cycle sinking."),
     cl::init(50), cl::Hidden);
 
+// When a value-producing load dominates a diamond and its result is consumed in
+// more than one successor, ordinary sinking cannot move it (there is no single
+// sink target). Hoisting such a load -- as SimplifyCFG's
+// hoistCommonCodeFromSuccessors does -- is dynamically neutral but stretches
+// the loaded value's live range across the conditional, which hurts under
+// register pressure. When enabled, sink-with-duplication clones the load into
+// each using successor and removes the dominating copy, shortening the live
+// range. Gated off by default.
+static cl::opt<bool> EnableDiamondLoadSink(
+    "machine-sink-diamond-loads", cl::Hidden, cl::init(false),
+    cl::desc("Sink-with-duplication a load that dominates a diamond into its "
+             "using successors to shorten its live range across the branch"));
+
+// A clone into mutually-exclusive successors is dynamically neutral -- exactly
+// one copy runs per pass -- so unlike ordinary sinking its only cost is static
+// code size. The profitability bar is therefore low: it fires when the clone
+// shortens a live range at all, cheaply, in a loop, without pushing any target
+// over its own pressure limit. These knobs tune that bar; -force skips it
+// entirely for testing the mechanics.
+static cl::opt<bool> ForceDiamondLoadSink(
+    "machine-sink-diamond-loads-force", cl::Hidden, cl::init(false),
+    cl::desc("Skip the profitability heuristics for diamond-load sinking "
+             "(testing only); safety/legality checks still apply"));
+
+static cl::opt<unsigned> DiamondLoadSinkMaxFanout(
+    "machine-sink-diamond-loads-max-fanout", cl::Hidden, cl::init(2),
+    cl::desc("Maximum number of successor clones for diamond-load sinking "
+             "(bounds static code growth)"));
+
+static cl::opt<unsigned> DiamondLoadSinkSpanThreshold(
+    "machine-sink-diamond-loads-span", cl::Hidden, cl::init(8),
+    cl::desc("Sink a diamond load when the value would otherwise stay live "
+             "across at least this many instructions (def's block tail plus "
+             "the depth of the first use in an arm)"));
+
+static cl::opt<unsigned> DiamondLoadSinkChainDepth(
+    "machine-sink-diamond-loads-chain", cl::Hidden, cl::init(4),
+    cl::desc("Sink a diamond load when its value feeds a dependency chain of "
+             "at least this depth in an arm (e.g. a reduction)"));
+
 STATISTIC(NumSunk, "Number of machine instructions sunk");
+STATISTIC(NumDiamondLoadsSunk,
+          "Number of diamond loads sunk-with-duplication into successors");
 STATISTIC(NumCycleSunk, "Number of machine instructions sunk into a cycle");
 STATISTIC(NumSplit, "Number of critical edges split");
 STATISTIC(NumCoalesces, "Number of copies coalesced");
@@ -244,6 +286,13 @@ private:
                                  MachineBasicBlock *To, bool BreakPHIEdge);
   bool SinkInstruction(MachineInstr &MI, bool &SawStore,
                        AllSuccsCache &AllSuccessors);
+
+  /// Sink a load that dominates a diamond by cloning it into each successor
+  /// block that consumes its result, then erasing the original. This shortens
+  /// the loaded value's live range when it would otherwise span the
+  /// conditional. Returns true if the load was sunk. Gated by
+  /// -machine-sink-diamond-loads.
+  bool sinkDiamondLoadToUsers(MachineInstr &MI, MachineBasicBlock *MBB);
 
   /// If we sink a COPY inst, some debug users of it's destination may no
   /// longer be dominated by the COPY, and will eventually be dropped.
@@ -1875,8 +1924,13 @@ bool MachineSinking::SinkInstruction(MachineInstr &MI, bool &SawStore,
       FindSuccToSinkTo(MI, ParentBlock, BreakPHIEdge, AllSuccessors);
 
   // If there are no outputs, it must have side-effects.
-  if (!SuccToSinkTo)
-    return false;
+  if (!SuccToSinkTo) {
+    // FindSuccToSinkTo bails when the def is consumed by more than one
+    // successor (no single sink target). For a load that dominates a diamond,
+    // we can instead clone it into each using successor to shorten its live
+    // range. This is a no-op for non-candidates.
+    return sinkDiamondLoadToUsers(MI, ParentBlock);
+  }
 
   // If the instruction to move defines a dead physical register which is live
   // when leaving the basic block, don't move it because it could turn into a
@@ -1998,6 +2052,204 @@ bool MachineSinking::SinkInstruction(MachineInstr &MI, bool &SawStore,
   for (MachineOperand &MO : MI.all_uses())
     RegsToClearKillFlags.insert(MO.getReg()); // Remember to clear kill flags.
 
+  return true;
+}
+
+// Count non-debug instructions strictly after MI to the end of its block.
+static unsigned numNonDebugInstrsAfter(MachineInstr &MI) {
+  unsigned N = 0;
+  for (MachineInstr &O : make_range(std::next(MachineBasicBlock::iterator(MI)),
+                                    MI.getParent()->end()))
+    if (!O.isDebugOrPseudoInstr())
+      ++N;
+  return N;
+}
+
+// Number of non-debug instructions from the top of S up to the first
+// instruction that reads Reg. Returns ~0u if Reg is not read in S.
+static unsigned firstUseDepthInBlock(Register Reg, MachineBasicBlock &S) {
+  unsigned N = 0;
+  for (MachineInstr &I : S) {
+    if (I.isDebugOrPseudoInstr())
+      continue;
+    if (I.readsRegister(Reg, /*TRI=*/nullptr))
+      return N;
+    ++N;
+  }
+  return ~0u;
+}
+
+// True if the value in Reg feeds a dependency chain of at least MinDepth
+// value-producing instructions. Such a value sits early in a long computation
+// (e.g. a reduction), so pinning a register for it across the branch is most
+// costly -- exactly where shortening the live range pays off. Follows the first
+// single-def virtual-register user at each step, bounded.
+static bool feedsDeepChain(Register Reg, const MachineRegisterInfo *MRI,
+                           unsigned MinDepth) {
+  Register Cur = Reg;
+  for (unsigned Depth = 0; Depth < MinDepth + 1;) {
+    MachineInstr *Next = nullptr;
+    for (MachineInstr &U : MRI->use_nodbg_instructions(Cur)) {
+      if (U.getNumExplicitDefs() != 1)
+        continue;
+      const MachineOperand &D = *U.defs().begin();
+      if (D.isReg() && D.getReg().isVirtual() && !D.getSubReg()) {
+        Next = &U;
+        break;
+      }
+    }
+    if (!Next)
+      return false;
+    if (++Depth >= MinDepth)
+      return true;
+    Cur = Next->defs().begin()->getReg();
+  }
+  return false;
+}
+
+bool MachineSinking::sinkDiamondLoadToUsers(MachineInstr &MI,
+                                            MachineBasicBlock *MBB) {
+  if (!EnableDiamondLoadSink)
+    return false;
+
+  // Only consider plain, side-effect-free loads the target is willing to sink.
+  if (!MI.mayLoad() || MI.mayStore() || MI.hasOrderedMemoryRef() ||
+      MI.isCall() || MI.hasUnmodeledSideEffects() || MI.isConvergent())
+    return false;
+  if (!TII->shouldSink(MI))
+    return false;
+
+  // Require exactly one explicit def: a virtual register, not dead, no subreg,
+  // with a single definition. Physreg uses are only safe to duplicate if they
+  // cannot be redefined on the path (mirrors FindSuccToSinkTo).
+  Register DefReg;
+  for (const MachineOperand &MO : MI.operands()) {
+    if (!MO.isReg() || !MO.getReg())
+      continue;
+    if (MO.isDef()) {
+      if (DefReg.isValid() || !MO.getReg().isVirtual() || MO.isDead() ||
+          MO.getSubReg())
+        return false;
+      DefReg = MO.getReg();
+    } else if (MO.getReg().isPhysical()) {
+      if (!MRI->isConstantPhysReg(MO.getReg()) && !TII->isIgnorableUse(MO))
+        return false;
+    }
+  }
+  if (!DefReg.isValid() || !MRI->hasOneDef(DefReg))
+    return false;
+  const TargetRegisterClass *RC = MRI->getRegClass(DefReg);
+  if (!TII->isSafeToMoveRegClassDefs(RC))
+    return false;
+
+  // Collect the distinct successor blocks that use DefReg. Require a use in
+  // more than one successor (single-successor uses are handled by ordinary
+  // sinking), no PHI use (those want the value in a predecessor), no use in MBB
+  // itself, and every using block to be a direct successor of MBB.
+  SmallPtrSet<MachineBasicBlock *, 4> SuccSet(MBB->succ_begin(),
+                                              MBB->succ_end());
+  SmallSetVector<MachineBasicBlock *, 4> UsingBlocks;
+  for (MachineInstr &Use : MRI->use_nodbg_instructions(DefReg)) {
+    if (Use.isPHI())
+      return false;
+    MachineBasicBlock *UseBB = Use.getParent();
+    if (UseBB == MBB || !SuccSet.contains(UseBB))
+      return false;
+    UsingBlocks.insert(UseBB);
+  }
+  if (UsingBlocks.size() < 2 || UsingBlocks.size() > DiamondLoadSinkMaxFanout)
+    return false;
+
+  // Each using block must have MBB as its *only* predecessor. That single
+  // condition buys two things at once:
+  //   * Dynamic neutrality: with no other entry, an arm is reached only by
+  //     MBB's branch, so exactly one arm (hence one clone) runs per pass --
+  //     never two. The arms are mutually exclusive by construction.
+  //   * A trivial path for memory safety: the only path from the load to a
+  //     clone site is MBB-tail -> arm-top (the direct edge), with no
+  //     intervening block. So we need only check MBB's tail for aliasing
+  //     stores, not the arms (whose stores all follow the clone we insert at
+  //     the top).
+  // Also reject odd sink targets.
+  for (MachineBasicBlock *S : UsingBlocks) {
+    if (S->pred_size() != 1 || S->isEHPad() ||
+        S->isInlineAsmBrIndirectTarget())
+      return false;
+    if (MachineCycle *C = CI->getCycle(S))
+      if (!C->isReducible() || C->getHeader() == S)
+        return false;
+  }
+
+  // Memory safety: cloning moves the load later on each path. Given the
+  // single-predecessor arms above, the only instructions between the load and
+  // its clones are MBB's tail; reject if any aliasing store, call, or
+  // side-effecting instruction appears there.
+  auto IsBarrier = [&](MachineInstr &O) {
+    if (O.isCall() || O.hasUnmodeledSideEffects())
+      return true;
+    return O.mayStore() && O.mayAlias(AA, MI, /*UseTBAA=*/false);
+  };
+  for (MachineInstr &O :
+       make_range(std::next(MachineBasicBlock::iterator(MI)), MBB->end()))
+    if (IsBarrier(O))
+      return false;
+
+  // Profitability. The clone is dynamically neutral, so its only cost is static
+  // code size; the bar is correspondingly low and is NOT the spill-pressure
+  // limit ordinary sinking uses (the value need never spill for the live range
+  // to hurt scheduling). We fire when the load recurs in a loop and shortens a
+  // meaningful live range. We deliberately do NOT gate on the consuming arm's
+  // pressure: the value is already live-in there (it is used in the arm), so
+  // sinking does not raise the arm's peak -- it only removes the value's live
+  // range across the branch in MBB, which is the whole point.
+  if (!ForceDiamondLoadSink) {
+    // (C) Recurrence: only worth the static cost where it repeats.
+    if (!CI->getCycle(MBB))
+      return false;
+
+    // (D) Non-trivial shortening: the value must currently stay live across a
+    // meaningful span (def's block tail + depth of the first use in an arm),
+    // or feed a deep dependency chain (a reduction-style consumer that pins a
+    // register). Either signal suffices.
+    unsigned Span = numNonDebugInstrsAfter(MI);
+    bool Worthwhile = feedsDeepChain(DefReg, MRI, DiamondLoadSinkChainDepth);
+    for (MachineBasicBlock *S : UsingBlocks) {
+      unsigned UseDepth = firstUseDepthInBlock(DefReg, *S);
+      if (UseDepth != ~0u && Span + UseDepth >= DiamondLoadSinkSpanThreshold)
+        Worthwhile = true;
+    }
+    if (!Worthwhile)
+      return false;
+  }
+
+  // Bail before mutating if any clone site has prologue interference.
+  for (MachineBasicBlock *S : UsingBlocks) {
+    MachineBasicBlock::iterator InsertPos = S->SkipPHIsAndLabels(S->begin());
+    if (blockPrologueInterferes(S, InsertPos, MI, TRI, TII, MRI))
+      return false;
+  }
+
+  // Clone the load into each using successor and rewrite that block's uses.
+  for (MachineBasicBlock *S : UsingBlocks) {
+    MachineBasicBlock::iterator InsertPos = S->SkipPHIsAndLabels(S->begin());
+    Register NewReg = MRI->createVirtualRegister(RC);
+    MachineInstr *Clone = MI.getMF()->CloneMachineInstr(&MI);
+    Clone->substituteRegister(DefReg, NewReg, /*SubIdx=*/0, *TRI);
+    S->insert(InsertPos, Clone);
+
+    // Rewrite all uses (including debug) of DefReg within S to the local clone.
+    for (MachineOperand &MO :
+         llvm::make_early_inc_range(MRI->use_operands(DefReg)))
+      if (MO.getParent()->getParent() == S)
+        MO.setReg(NewReg);
+
+    LLVM_DEBUG(dbgs() << "Diamond-load clone into " << printMBBReference(*S)
+                      << ": " << *Clone);
+  }
+
+  LLVM_DEBUG(dbgs() << "Erasing dominating diamond load: " << MI);
+  MI.eraseFromParent();
+  ++NumDiamondLoadsSunk;
   return true;
 }
 

@@ -140,6 +140,32 @@ static cl::opt<bool> DisableBranchOpts(
     "disable-cgp-branch-opts", cl::Hidden, cl::init(false),
     cl::desc("Disable branch optimizations in CodeGenPrepare"));
 
+// A load that dominates a diamond and is consumed in more than one arm has had
+// its live range stretched across the conditional (typically by SimplifyCFG's
+// hoistCommonCodeFromSuccessors). The clone is dynamically neutral -- exactly
+// one arm runs per pass -- so its only cost is static code size. Sinking it
+// with duplication into each arm shortens the live range before ISel and lets
+// later passes (e.g. load-pair formation) treat each arm independently. Gated
+// off by default.
+static cl::opt<bool> EnableSinkDiamondLoads(
+    "cgp-sink-diamond-loads", cl::Hidden, cl::init(false),
+    cl::desc("Sink-with-duplication a load that dominates a diamond into its "
+             "using arms to shorten its live range across the branch"));
+
+static cl::opt<unsigned> SinkDiamondLoadsMaxFanout(
+    "cgp-sink-diamond-loads-max-fanout", cl::Hidden, cl::init(2),
+    cl::desc("Maximum number of arm clones for diamond-load sinking in CGP"));
+
+static cl::opt<unsigned> SinkDiamondLoadsChainDepth(
+    "cgp-sink-diamond-loads-chain", cl::Hidden, cl::init(4),
+    cl::desc("Sink a diamond load when its value feeds a dependency chain of "
+             "at least this depth in an arm (e.g. a reduction)"));
+
+static cl::opt<bool> ForceSinkDiamondLoads(
+    "cgp-sink-diamond-loads-force", cl::Hidden, cl::init(false),
+    cl::desc("Skip the profitability heuristics for CGP diamond-load sinking "
+             "(testing only); safety/legality checks still apply"));
+
 static cl::opt<bool>
     DisableGCOpts("disable-cgp-gc-opts", cl::Hidden, cl::init(false),
                   cl::desc("Disable GC optimizations in CodeGenPrepare"));
@@ -431,6 +457,7 @@ private:
   bool optimizeExt(Instruction *&I);
   bool optimizeExtUses(Instruction *I);
   bool optimizeLoadExt(LoadInst *Load);
+  bool sinkLoadAcrossDiamond(LoadInst *Load);
   bool optimizeShiftInst(BinaryOperator *BO);
   bool optimizeFunnelShift(IntrinsicInst *Fsh);
   bool optimizeSelectInst(SelectInst *SI);
@@ -7394,6 +7421,110 @@ bool CodeGenPrepare::optimizeExtUses(Instruction *I) {
   return MadeChange;
 }
 
+// True if the value V feeds a dependency chain of at least MinDepth
+// instructions. Such a value sits early in a long computation (e.g. a
+// reduction), where pinning a register for it across the branch is most
+// costly. Explores all users level by level (bounded), so it is not fooled by
+// a reduction DAG whose nodes have several users.
+static bool feedsDeepChain(Value *V, unsigned MinDepth) {
+  SmallVector<Value *, 16> Frontier{V};
+  SmallPtrSet<Value *, 32> Visited{V};
+  auto IsChainStep = [](Instruction *UI) {
+    return UI && !UI->getType()->isVoidTy() && !UI->isTerminator() &&
+           !isa<PHINode>(UI);
+  };
+  for (unsigned Depth = 0; Depth < MinDepth; ++Depth) {
+    SmallVector<Value *, 16> Next;
+    for (Value *Cur : Frontier)
+      for (User *U : Cur->users())
+        if (auto *UI = dyn_cast<Instruction>(U); IsChainStep(UI))
+          if (Visited.insert(UI).second && Visited.size() < 512)
+            Next.push_back(UI);
+    if (Next.empty())
+      return false;
+    Frontier = std::move(Next);
+  }
+  return true;
+}
+
+// Sink a load that dominates a diamond by cloning it into each arm that
+// consumes its result, then erasing the original. This shortens the loaded
+// value's live range when SimplifyCFG hoisted a load common to the arms up into
+// their shared predecessor, stretching it across the conditional. The clone is
+// dynamically neutral (exactly one arm runs per pass), so its only cost is
+// static code size. Gated by -cgp-sink-diamond-loads.
+bool CodeGenPrepare::sinkLoadAcrossDiamond(LoadInst *Load) {
+  if (!EnableSinkDiamondLoads)
+    return false;
+
+  // Only plain loads: volatile/atomic loads have observable position.
+  if (!Load->isSimple())
+    return false;
+
+  BasicBlock *BB = Load->getParent();
+
+  // Collect the distinct arms that use the load. Require a use in more than one
+  // successor (a single-successor use is ordinary sinking), no use in BB
+  // itself, no PHI use (those want the value in a predecessor), and each using
+  // arm to be a direct successor of BB whose *only* predecessor is BB. That
+  // sole-predecessor condition makes the arms mutually exclusive (exactly one
+  // clone runs per pass) and means the only path from the load to a clone site
+  // is BB's tail -> arm, so memory safety only has to consider BB's tail.
+  SmallPtrSet<BasicBlock *, 4> SuccSet(succ_begin(BB), succ_end(BB));
+  SmallSetVector<BasicBlock *, 4> Arms;
+  for (User *U : Load->users()) {
+    auto *UI = dyn_cast<Instruction>(U);
+    if (!UI || isa<PHINode>(UI))
+      return false;
+    BasicBlock *UseBB = UI->getParent();
+    if (UseBB == BB || !SuccSet.contains(UseBB))
+      return false;
+    Arms.insert(UseBB);
+  }
+  if (Arms.size() < 2 || Arms.size() > SinkDiamondLoadsMaxFanout)
+    return false;
+  for (BasicBlock *Arm : Arms)
+    if (Arm->getUniquePredecessor() != BB || Arm->isEHPad())
+      return false;
+
+  // Memory safety: cloning moves the load later. Given sole-predecessor arms,
+  // the only instructions between the load and its clones are BB's tail; reject
+  // if any of them may write memory or otherwise has observable side effects.
+  // (Moving a pure load to execute later -- or not at all on some path -- is
+  // fine; only an intervening aliasing write would change its value.)
+  for (Instruction &I : make_range(std::next(Load->getIterator()), BB->end()))
+    if (I.mayWriteToMemory() || I.mayHaveSideEffects())
+      return false;
+
+  // Profitability. The clone is dynamically neutral, so the bar is low: fire
+  // when the load recurs in a loop and feeds a meaningful computation in an arm
+  // (a reduction-style chain), where the cross-branch live range hurts the
+  // schedule. -force skips this for testing.
+  if (!ForceSinkDiamondLoads) {
+    if (!LI->getLoopFor(BB))
+      return false;
+    if (!feedsDeepChain(Load, SinkDiamondLoadsChainDepth))
+      return false;
+  }
+
+  // Clone the load into each arm before the arm's first use, and rewrite that
+  // arm's uses to the local clone.
+  for (BasicBlock *Arm : Arms) {
+    Instruction *InsertPt = &*Arm->getFirstInsertionPt();
+    auto *Clone = cast<LoadInst>(Load->clone());
+    Clone->insertBefore(InsertPt->getIterator());
+    if (Load->hasName())
+      Clone->setName(Load->getName() + ".sunk");
+    Load->replaceUsesWithIf(Clone, [&](Use &U) {
+      auto *UI = cast<Instruction>(U.getUser());
+      return UI->getParent() == Arm;
+    });
+  }
+
+  Load->eraseFromParent();
+  return true;
+}
+
 // Find loads whose uses only use some of the loaded value's bits.  Add an "and"
 // just after the load if the target can fold this into one extload instruction,
 // with the hope of eliminating some of the other later "and" instructions using
@@ -8975,6 +9106,8 @@ bool CodeGenPrepare::optimizeInst(Instruction *I, ModifyDT &ModifiedDT) {
       return true;
 
   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+    if (sinkLoadAcrossDiamond(LI))
+      return true; // LI has been erased.
     LI->setMetadata(LLVMContext::MD_invariant_group, nullptr);
     bool Modified = optimizeLoadExt(LI);
     unsigned AS = LI->getPointerAddressSpace();
