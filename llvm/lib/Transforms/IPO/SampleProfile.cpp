@@ -34,6 +34,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BlockFrequencyInfoImpl.h"
+#include "llvm/Analysis/IndirectCallVisitor.h"
 #include "llvm/Analysis/InlineAdvisor.h"
 #include "llvm/Analysis/InlineCost.h"
 #include "llvm/Analysis/LazyCallGraph.h"
@@ -338,6 +339,14 @@ static cl::opt<bool> AnnotateSampleProfileInlinePhase(
 
 namespace llvm {
 extern cl::opt<bool> EnableExtTspBlockPlacement;
+// Defined in lib/ProfileData/InstrProf.cpp. When true, the sample loader emits
+// IPVK_VTableTarget value profile metadata derived from the vtable type
+// samples in the profile, enabling vtable-based devirtualization in the
+// downstream ICP pass.
+extern cl::opt<bool> EnableVTableProfileUse;
+// Defined in lib/Analysis/IndirectCallPromotionAnalysis.cpp. Caps the number
+// of vtables annotated per virtual call site.
+extern cl::opt<unsigned> MaxNumVTableAnnotations;
 }
 
 namespace {
@@ -528,6 +537,7 @@ protected:
   std::vector<Function *> buildFunctionOrder(Module &M, LazyCallGraph &CG);
   std::unique_ptr<ProfiledCallGraph> buildProfiledCallGraph(Module &M);
   void generateMDProfMetadata(Function &F);
+  void annotateVTableProfMetadata(Instruction &Inst);
   bool rejectHighStalenessProfile(Module &M, ProfileSummaryInfo *PSI,
                                   const SampleProfileMap &Profiles);
   void removePseudoProbeInstsDiscriminator(Module &M);
@@ -1607,6 +1617,60 @@ GetSortedValueDataFromCallTargets(const SampleRecord::CallTargetMap &M) {
   return R;
 }
 
+// For the vtable-load instruction feeding the indirect call \p Inst, attach
+// IPVK_VTableTarget value profile metadata derived from the vtable type
+// samples collected at the load's source location. This is the sample-PGO
+// counterpart of the IPVK_IndirectCallTarget metadata attached to the call
+// itself: the downstream ICP pass consumes it (under -enable-vtable-profile-use
+// together with type metadata from -fwhole-program-vtables) to emit vtable
+// pointer comparisons, and ModuleSummaryAnalysis records the referenced
+// vtables as summary ref edges so ThinLTO imports their definitions.
+void SampleProfileLoader::annotateVTableProfMetadata(Instruction &Inst) {
+  CallBase *CB = dyn_cast<CallBase>(&Inst);
+  if (!CB)
+    return;
+
+  // Find the instruction that loads the vtable pointer feeding the call.
+  Instruction *VPtr = PGOIndirectCallVisitor::tryGetVTableInstruction(CB);
+  if (!VPtr)
+    return;
+
+  // Type samples are recorded against the vtable-load's own source location and
+  // inlined context, so look both up from the load instruction.
+  const DILocation *DIL = VPtr->getDebugLoc();
+  if (!DIL)
+    return;
+  const FunctionSamples *FS = findFunctionSamples(*VPtr);
+  if (!FS)
+    return;
+
+  // Use the same callsite-identifier abstraction as the rest of the sample
+  // loader so the lookup matches how llvm-profgen keyed the type samples: the
+  // pseudo-probe index for probe-based profiles, or the line offset and base
+  // discriminator otherwise.
+  LineLocation Loc = FunctionSamples::getCallSiteIdentifier(DIL);
+  const TypeCountMap *TypeCounts = FS->findCallsiteTypeSamplesAt(Loc);
+  if (!TypeCounts || TypeCounts->empty())
+    return;
+
+  SmallVector<InstrProfValueData, 4> VTableValueData;
+  uint64_t Sum = 0;
+  for (const auto &[Type, Count] : *TypeCounts) {
+    Sum += Count;
+    VTableValueData.push_back(InstrProfValueData{Type.getHashCode(), Count});
+  }
+  // Annotate the hottest vtables first, matching IRPGO's ordering.
+  llvm::sort(VTableValueData,
+             [](const InstrProfValueData &L, const InstrProfValueData &R) {
+               return std::tie(L.Count, L.Value) > std::tie(R.Count, R.Value);
+             });
+
+  annotateValueSite(*Inst.getModule(), *VPtr, VTableValueData, Sum,
+                    IPVK_VTableTarget,
+                    std::min<uint32_t>(VTableValueData.size(),
+                                       MaxNumVTableAnnotations));
+}
+
 // Generate MD_prof metadata for every branch instruction using the
 // edge weights computed during propagation.
 void SampleProfileLoader::generateMDProfMetadata(Function &F) {
@@ -1623,6 +1687,13 @@ void SampleProfileLoader::generateMDProfMetadata(Function &F) {
         if (!isa<CallInst>(I) && !isa<InvokeInst>(I))
           continue;
         if (!cast<CallBase>(I).getCalledFunction()) {
+          // Attach vtable type value profile to the vtable load feeding this
+          // indirect call so the ICP pass can devirtualize via vtable
+          // comparison. This is independent of the indirect-call-target value
+          // profile handled below, which may bail out early.
+          if (EnableVTableProfileUse)
+            annotateVTableProfMetadata(I);
+
           const DebugLoc &DLoc = I.getDebugLoc();
           if (!DLoc)
             continue;
