@@ -61,6 +61,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils/CodeLayout.h"
@@ -68,6 +69,7 @@
 #include <cassert>
 #include <cstdint>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -229,6 +231,24 @@ static cl::opt<unsigned> ExtTspBlockPlacementMaxBlocks(
 static cl::opt<bool>
     ApplyExtTspForSize("apply-ext-tsp-for-size", cl::init(false), cl::Hidden,
                        cl::desc("Use ext-tsp for size-aware block placement."));
+
+// PROTOTYPE: context-path-sensitive layout. A stand-in text carrier of
+// pseudo-probe-keyed context->successor path counts, used to make
+// context-sensitive successor choices in block placement. This is a placeholder
+// for a future probe-keyed SampleProf section delivered through the
+// MIRProfileLoader slot that already runs immediately before this pass; see the
+// design note "Propagating context-path counts into block placement".
+static cl::opt<std::string> MbpPathProfileFile(
+    "mbp-path-profile-file", cl::Hidden, cl::init(""),
+    cl::desc("PROTOTYPE: file of pseudo-probe-keyed context->successor path "
+             "counts for context-sensitive block placement."));
+
+// The maximum context length (k) consulted from the path profile. The profile
+// lookup backs off from the longest available context, TAGE-style.
+static cl::opt<unsigned> MbpPathProfileContext(
+    "mbp-path-profile-context", cl::Hidden, cl::init(2),
+    cl::desc("PROTOTYPE: max arrival-context length consulted from the MBP "
+             "path profile."));
 
 namespace llvm {
 extern cl::opt<bool> EnableExtTspBlockPlacement;
@@ -462,6 +482,37 @@ class MachineBlockPlacement {
   /// blocks and their successors through the pass.
   SmallPtrSet<MachineBasicBlock *, 4> BlocksWithUnanalyzableExits;
 #endif
+
+  //===--------------------------------------------------------------------===//
+  // PROTOTYPE: context-path-sensitive successor selection.
+  //
+  // Consumes pseudo-probe-keyed context->successor path counts (see the design
+  // note "Propagating context-path counts into block placement"). The arrival
+  // context of a block is the already-placed chain prefix ending at it; we look
+  // up the highest-count successor for that context and, if it is viable here,
+  // prefer it over the order-0 branch-probability choice. The text carrier
+  // loaded here is a stand-in for a future probe-keyed SampleProf section
+  // delivered through the MIRProfileLoader slot that already runs right before
+  // this pass.
+  //===--------------------------------------------------------------------===//
+
+  /// Context key ("g:i;g:i", oldest->newest, newest == the block's own probe)
+  ///   -> (successor probe key "g:i" -> count).
+  std::map<std::string, std::map<std::string, uint64_t>> PathProfile;
+  /// MBB -> its block probe key "GUID:Index".
+  DenseMap<const MachineBasicBlock *, std::string> BlockProbeKey;
+  /// Block probe key "GUID:Index" -> MBB (reverse of BlockProbeKey).
+  std::map<std::string, MachineBasicBlock *> ProbeKeyToBlock;
+  /// Whether a usable path profile was loaded for the current function.
+  bool HasPathProfile = false;
+
+  /// Load the prototype path-count carrier and build probe<->block maps.
+  void initPathProfile();
+  /// Highest-count viable successor of BB for the current arrival context, or
+  /// nullptr if the profile has no applicable entry.
+  MachineBasicBlock *
+  selectContextualSuccessor(const MachineBasicBlock *BB, const BlockChain &Chain,
+                            ArrayRef<MachineBasicBlock *> Successors) const;
 
   /// Get block profile count or frequency according to UseProfileCount.
   /// The return value is used to model tail duplication cost.
@@ -1659,6 +1710,144 @@ bool MachineBlockPlacement::hasBetterLayoutPredecessor(
 ///
 /// \returns The best successor block found, or null if none are viable, along
 /// with a boolean indicating if tail duplication is necessary.
+// PROTOTYPE: load the pseudo-probe-keyed context->successor path counts and
+// build the machine-block <-> probe correlation. See the design note
+// "Propagating context-path counts into block placement".
+void MachineBlockPlacement::initPathProfile() {
+  PathProfile.clear();
+  BlockProbeKey.clear();
+  ProbeKeyToBlock.clear();
+  HasPathProfile = false;
+  if (!MbpPathProfileFile.getNumOccurrences())
+    return;
+
+  // Correlate machine blocks to pseudo probes that survive to MIR. Each block's
+  // identity is (GUID, ProbeIndex), taken from its first PSEUDO_PROBE. This is
+  // the optimization-stable key the design relies on; PSEUDO_PROBE is emitted at
+  // ISel and is still present here (PseudoProbeInserter runs later, at
+  // pre-emit).
+  for (MachineBasicBlock &MBB : *F) {
+    for (const MachineInstr &MI : MBB) {
+      if (!MI.isPseudoProbe())
+        continue;
+      // Operand layout: [GUID, Index, Type, Attr].
+      uint64_t Guid = MI.getOperand(0).getImm();
+      uint64_t Index = MI.getOperand(1).getImm();
+      std::string Key = std::to_string(Guid) + ":" + std::to_string(Index);
+      BlockProbeKey[&MBB] = Key;
+      ProbeKeyToBlock[Key] = &MBB;
+      break;
+    }
+  }
+  if (BlockProbeKey.empty())
+    return;
+
+  std::string FileName = MbpPathProfileFile;
+  auto BufOrErr = MemoryBuffer::getFile(FileName);
+  if (!BufOrErr) {
+    errs() << "warning: MBP path profile: cannot open '" << FileName
+           << "': " << BufOrErr.getError().message() << "\n";
+    return;
+  }
+
+  // Carrier format (stand-in for a probe-keyed SampleProf section):
+  //   <ctxProbe1> <ctxProbe2> ... <ctxProbeK> -> <succProbe> : <count>
+  // each probe is "GUID:Index"; the last context probe is the block's own
+  // probe; '#' starts a comment.
+  SmallVector<StringRef, 16> Lines;
+  (*BufOrErr)->getBuffer().split(Lines, '\n');
+  for (StringRef Line : Lines) {
+    Line = Line.trim();
+    if (Line.empty() || Line.starts_with("#"))
+      continue;
+    auto [Left, Rest] = Line.split("->");
+    if (Rest.empty())
+      continue;
+    // Split the trailing " : <count>"; use rsplit because the successor probe
+    // key ("GUID:Index") itself contains a colon.
+    auto [SuccPart, CountPart] = Rest.rsplit(':');
+    SuccPart = SuccPart.trim();
+    uint64_t Count = 0;
+    if (SuccPart.empty() || CountPart.trim().getAsInteger(10, Count))
+      continue;
+    SmallVector<StringRef, 4> CtxProbes;
+    Left.split(CtxProbes, ' ', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+    std::string CtxKey;
+    for (StringRef P : CtxProbes) {
+      P = P.trim();
+      if (P.empty())
+        continue;
+      if (!CtxKey.empty())
+        CtxKey += ';';
+      CtxKey += P.str();
+    }
+    if (CtxKey.empty())
+      continue;
+    PathProfile[CtxKey][SuccPart.str()] += Count;
+  }
+  HasPathProfile = !PathProfile.empty();
+  LLVM_DEBUG(dbgs() << "MBP path profile: loaded " << PathProfile.size()
+                    << " context entries over " << BlockProbeKey.size()
+                    << " probed blocks in " << F->getName() << "\n");
+}
+
+// PROTOTYPE: return the highest-count viable successor of BB given the arrival
+// context (the placed chain prefix ending at BB), backing off from the longest
+// available context. Returns nullptr when the profile has no applicable entry.
+MachineBasicBlock *MachineBlockPlacement::selectContextualSuccessor(
+    const MachineBasicBlock *BB, const BlockChain &Chain,
+    ArrayRef<MachineBasicBlock *> Successors) const {
+  if (!HasPathProfile || Successors.empty())
+    return nullptr;
+
+  // Build the arrival-context probe sequence: the placed chain prefix ending at
+  // BB, oldest->newest, with BB's own probe last. A probe-less block breaks the
+  // context (we cannot reason about a gap), so restart from it.
+  SmallVector<StringRef, 8> Ctx;
+  SmallVector<const MachineBasicBlock *, 8> Prefix(Chain.begin(), Chain.end());
+  while (!Prefix.empty() && Prefix.back() != BB)
+    Prefix.pop_back();
+  for (const MachineBasicBlock *CB : Prefix) {
+    auto It = BlockProbeKey.find(CB);
+    if (It == BlockProbeKey.end())
+      Ctx.clear();
+    else
+      Ctx.push_back(It->second);
+  }
+  if (Ctx.empty())
+    return nullptr;
+
+  unsigned K = std::min<unsigned>(MbpPathProfileContext, Ctx.size());
+  for (unsigned Len = K; Len >= 1; --Len) {
+    std::string Key;
+    for (unsigned I = Ctx.size() - Len; I < Ctx.size(); ++I) {
+      if (!Key.empty())
+        Key += ';';
+      Key += Ctx[I].str();
+    }
+    auto It = PathProfile.find(Key);
+    if (It == PathProfile.end())
+      continue;
+    MachineBasicBlock *Best = nullptr;
+    uint64_t BestCount = 0;
+    for (const auto &[SuccKey, Count] : It->second) {
+      auto BIt = ProbeKeyToBlock.find(SuccKey);
+      if (BIt == ProbeKeyToBlock.end())
+        continue;
+      MachineBasicBlock *Cand = BIt->second;
+      if (!llvm::is_contained(Successors, Cand))
+        continue;
+      if (Count > BestCount) {
+        BestCount = Count;
+        Best = Cand;
+      }
+    }
+    if (Best)
+      return Best; // longest matching context wins
+  }
+  return nullptr;
+}
+
 MachineBlockPlacement::BlockAndTailDupResult
 MachineBlockPlacement::selectBestSuccessor(const MachineBasicBlock *BB,
                                            const BlockChain &Chain,
@@ -1686,6 +1875,20 @@ MachineBlockPlacement::selectBestSuccessor(const MachineBasicBlock *BB,
         (!BlockFilter || BlockFilter->count(Result.BB)) &&
         SuccChain != &Chain && Result.BB == *SuccChain->begin())
       return Result;
+  }
+
+  // PROTOTYPE: context-path-sensitive successor selection. If a probe-keyed
+  // path profile says a specific successor dominates *given how we arrived at
+  // BB* (the placed chain prefix), and that successor is viable here, prefer it
+  // over the order-0 branch-probability choice below. Gated by
+  // -mbp-path-profile-file, so default behavior is unchanged.
+  if (HasPathProfile) {
+    if (MachineBasicBlock *CtxSucc =
+            selectContextualSuccessor(BB, Chain, Successors)) {
+      LLVM_DEBUG(dbgs() << "    PathProfile selected: " << getBlockName(CtxSucc)
+                        << " (context-sensitive)\n");
+      return BlockAndTailDupResult{CtxSucc, /*ShouldTailDup=*/false};
+    }
   }
 
   // if BB is part of a trellis, Use the trellis to determine the optimal
@@ -3589,6 +3792,9 @@ bool MachineBlockPlacement::run(MachineFunction &MF) {
 
   // Initialize tail duplication thresholds.
   initTailDupThreshold();
+
+  // PROTOTYPE: load pseudo-probe-keyed context->successor path counts, if any.
+  initPathProfile();
 
   const bool OptForSize =
       llvm::shouldOptimizeForSize(&MF, PSI, &MBFI->getMBFI());

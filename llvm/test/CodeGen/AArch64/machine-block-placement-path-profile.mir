@@ -1,0 +1,67 @@
+# PROTOTYPE: context-path-sensitive block placement driven by a
+# pseudo-probe-keyed context->successor path-count carrier.
+#
+# The CFG is a diamond whose branch at bb.1 has two equally-likely successors,
+# so the order-0 branch-probability layout is a tie (broken toward bb.2). A path
+# profile keyed by the arrival context (chain prefix ending at bb.1, i.e. probes
+# 10 then 11) instead prefers bb.3, and the layout follows it.
+
+# RUN: rm -rf %t && split-file %s %t
+# RUN: llc -mtriple=arm64-apple-macos -run-pass=block-placement %t/test.mir -o - \
+# RUN:   | FileCheck %s --check-prefix=BASE
+# RUN: llc -mtriple=arm64-apple-macos -run-pass=block-placement \
+# RUN:     -mbp-path-profile-file=%t/ctx.prof %t/test.mir -o - \
+# RUN:   | FileCheck %s --check-prefix=CTX
+
+# Order-0 tie-break lays bb.2 immediately after bb.1.
+# BASE:      bb.1:
+# BASE:      bb.2:
+# BASE:      bb.3:
+
+# The context profile lays bb.3 immediately after bb.1 instead.
+# CTX:       bb.1:
+# CTX:       bb.3:
+# CTX:       bb.2:
+
+#--- test.mir
+--- |
+  define void @f(i32 %x) {
+    ret void
+  }
+...
+---
+name:            f
+alignment:       4
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    successors: %bb.1(0x80000000)
+    liveins: $w0
+    PSEUDO_PROBE 0, 10, 0, 0
+    B %bb.1
+
+  bb.1:
+    successors: %bb.2(0x40000000), %bb.3(0x40000000)
+    liveins: $w0
+    PSEUDO_PROBE 0, 11, 0, 0
+    CBNZW $w0, %bb.3
+    B %bb.2
+
+  bb.2:
+    successors: %bb.4(0x80000000)
+    PSEUDO_PROBE 0, 12, 0, 0
+    B %bb.4
+
+  bb.3:
+    successors: %bb.4(0x80000000)
+    PSEUDO_PROBE 0, 13, 0, 0
+    B %bb.4
+
+  bb.4:
+    PSEUDO_PROBE 0, 14, 0, 0
+    RET undef $lr
+...
+
+#--- ctx.prof
+# Arrived at probe 11 via probe 10 -> prefer successor probe 13 (bb.3).
+0:10 0:11 -> 0:13 : 1000
