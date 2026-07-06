@@ -13,6 +13,8 @@
 #include "ObjDumper.h"
 #include "StackMapPrinter.h"
 #include "llvm-readobj.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Object/MachO.h"
@@ -36,6 +38,7 @@ public:
   void printUnwindInfo() override;
   void printStackMap() const override;
   void printCGProfile() override;
+  void printBBAddrMaps(bool PrettyPGOAnalysis) override;
 
   void printNeededLibraries() override;
 
@@ -812,6 +815,50 @@ void MachODumper::printCGProfile() {
     W.printNumber("To", getSymbolName(*Obj->getSymbolByIndex(ToIndex)),
                   ToIndex);
     W.printNumber("Weight", Count);
+  }
+}
+
+void MachODumper::printBBAddrMaps(bool PrettyPGOAnalysis) {
+  std::vector<PGOAnalysisMap> PGOAnalyses;
+  Expected<std::vector<BBAddrMap>> BBAddrMapsOrErr =
+      Obj->readBBAddrMap(std::nullopt, &PGOAnalyses);
+  if (!BBAddrMapsOrErr) {
+    reportWarning(BBAddrMapsOrErr.takeError(), Obj->getFileName());
+    return;
+  }
+
+  // Build an address-to-name map for defined symbols so decoded functions can
+  // be labeled. Prefer global symbols over local ones (e.g. assembler
+  // temporary labels) that may share the same address.
+  DenseMap<uint64_t, std::pair<StringRef, bool>> AddrToName;
+  for (const SymbolRef &Sym : Obj->symbols()) {
+    Expected<uint64_t> AddrOrErr = Sym.getAddress();
+    if (!AddrOrErr) {
+      consumeError(AddrOrErr.takeError());
+      continue;
+    }
+    Expected<StringRef> NameOrErr = Sym.getName();
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
+      continue;
+    }
+    Expected<uint32_t> FlagsOrErr = Sym.getFlags();
+    bool IsGlobal = FlagsOrErr && (*FlagsOrErr & SymbolRef::SF_Global);
+    if (!FlagsOrErr)
+      consumeError(FlagsOrErr.takeError());
+    auto [It, Inserted] =
+        AddrToName.try_emplace(*AddrOrErr, *NameOrErr, IsGlobal);
+    if (!Inserted && IsGlobal && !It->second.second)
+      It->second = {*NameOrErr, IsGlobal};
+  }
+
+  ListScope L(W, "BBAddrMap");
+  for (const auto &[AM, PAM] : zip_equal(*BBAddrMapsOrErr, PGOAnalyses)) {
+    const BBAddrMap &Map = AM;
+    printBBAddrMapFunction(W, AM, PAM, PrettyPGOAnalysis, [&]() -> std::string {
+      StringRef FuncName = AddrToName.lookup(Map.getFunctionAddress()).first;
+      return FuncName.empty() ? "<?>" : FuncName.str();
+    });
   }
 }
 

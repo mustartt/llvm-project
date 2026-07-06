@@ -2078,18 +2078,29 @@ disassembleObject(ObjectFile &Obj, const ObjectFile &DbgObj,
   auto ReadBBAddrMap = [&](std::optional<unsigned> SectionIndex =
                                std::nullopt) {
     FullAddrMap.clear();
+    std::vector<PGOAnalysisMap> PGOAnalyses;
+    std::vector<BBAddrMap> BBAddrMaps;
     if (const auto *Elf = dyn_cast<ELFObjectFileBase>(&Obj)) {
-      std::vector<PGOAnalysisMap> PGOAnalyses;
       auto BBAddrMapsOrErr = Elf->readBBAddrMap(SectionIndex, &PGOAnalyses);
       if (!BBAddrMapsOrErr) {
         reportWarning(toString(BBAddrMapsOrErr.takeError()), Obj.getFileName());
         return;
       }
-      for (auto &&[FunctionBBAddrMap, FunctionPGOAnalysis] :
-           zip_equal(*std::move(BBAddrMapsOrErr), std::move(PGOAnalyses))) {
-        FullAddrMap.AddFunctionEntry(std::move(FunctionBBAddrMap),
-                                     std::move(FunctionPGOAnalysis));
+      BBAddrMaps = std::move(*BBAddrMapsOrErr);
+    } else if (const auto *MachO = dyn_cast<MachOObjectFile>(&Obj)) {
+      auto BBAddrMapsOrErr = MachO->readBBAddrMap(SectionIndex, &PGOAnalyses);
+      if (!BBAddrMapsOrErr) {
+        reportWarning(toString(BBAddrMapsOrErr.takeError()), Obj.getFileName());
+        return;
       }
+      BBAddrMaps = std::move(*BBAddrMapsOrErr);
+    } else {
+      return;
+    }
+    for (auto &&[FunctionBBAddrMap, FunctionPGOAnalysis] :
+         zip_equal(std::move(BBAddrMaps), std::move(PGOAnalyses))) {
+      FullAddrMap.AddFunctionEntry(std::move(FunctionBBAddrMap),
+                                   std::move(FunctionPGOAnalysis));
     }
   };
 

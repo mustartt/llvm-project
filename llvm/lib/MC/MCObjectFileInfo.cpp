@@ -1314,6 +1314,14 @@ MCObjectFileInfo::getBBAddrMapSection(const MCSection &TextSec) const {
     }
     return Ctx->getCOFFSection(Name, Characteristics, COMDATSymName, Selection,
                                COFFSec.getUniqueID());
+  } else if (Ctx->getObjectFileType() == MCContext::IsMachO) {
+    // MachO has no equivalent of SHF_LINK_ORDER to tie a metadata section to
+    // its text section, so all functions share a single section. Each entry
+    // carries a relocation to its function symbol, which the reader uses to
+    // associate the entry with the right text section. The section name is
+    // constrained to 16 bytes by the MachO format.
+    return Ctx->getMachOSection("__LLVM", "__llvm_bbaddrmap", 0,
+                                SectionKind::getMetadata());
   }
 
   return nullptr;

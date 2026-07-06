@@ -286,6 +286,14 @@ private:
       std::vector<MachOUtils::DwarfRelocationApplicationInfo>
           &RelocationsToApply);
 
+  /// Collect the __LLVM,__llvm_bbaddrmap section from \p Obj (if present),
+  /// relink its function-address fields to their final linked addresses using
+  /// the debug map, and append the result to \a BBAddrMapData. The linker drops
+  /// the section from the final image, so (like remarks) it is gathered from
+  /// the individual debug-map objects and emitted to a sidecar file.
+  void collectBBAddrMap(const llvm::dsymutil::DebugMapObject &Obj,
+                        const object::ObjectFile &Object);
+
   template <typename Linker>
   bool linkImpl(const DebugMap &Map,
                 typename Linker::OutputFileType ObjectType);
@@ -300,6 +308,11 @@ private:
   ThreadPoolInterface *ThreadPool;
 
   std::vector<std::string> EmptyWarnings;
+
+  /// Concatenated, address-relinked __llvm_bbaddrmap contents gathered from the
+  /// debug-map objects during a single link, emitted to a sidecar afterwards.
+  std::string BBAddrMapData;
+  std::mutex BBAddrMapMutex;
 
   /// A list of all .swiftinterface files referenced by the debug
   /// info, mapping Module name to path on disk. The entries need to

@@ -14,6 +14,7 @@
 #include <system_error>
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Object/ObjectFile.h"
@@ -27,6 +28,8 @@ class COFFImportFile;
 class ObjectFile;
 class XCOFFObjectFile;
 class ELFObjectFileBase;
+struct BBAddrMap;
+struct PGOAnalysisMap;
 } // namespace object
 namespace codeview {
 class GlobalTypeTableBuilder;
@@ -34,6 +37,18 @@ class MergingTypeTableBuilder;
 } // namespace codeview
 
 class ScopedPrinter;
+
+// Prints a single decoded BBAddrMap function entry (with its optional PGO
+// analysis) using \p W. Shared by the ELF and MachO dumpers. \p GetFunctionName
+// is invoked to obtain the function's name (and may emit format-specific
+// diagnostics) after the function address has been printed. If
+// \p PrettyPGOAnalysis is true, block frequencies are printed as relative
+// frequencies and branch probabilities as percentages; otherwise raw values
+// are displayed.
+void printBBAddrMapFunction(ScopedPrinter &W, const object::BBAddrMap &AM,
+                            const object::PGOAnalysisMap &PAM,
+                            bool PrettyPGOAnalysis,
+                            function_ref<std::string()> GetFunctionName);
 
 // Comparator to compare symbols.
 // Usage: the caller registers predicates (i.e., how to compare the symbols) by

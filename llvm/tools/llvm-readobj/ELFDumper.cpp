@@ -8471,86 +8471,21 @@ void LLVMELFDumper<ELFT>::printBBAddrMaps(bool PrettyPGOAnalysis) {
       continue;
     }
     for (const auto &[AM, PAM] : zip_equal(*BBAddrMapOrErr, PGOAnalyses)) {
-      DictScope D(W, "Function");
-      W.printHex("At", AM.getFunctionAddress());
-      SmallVector<uint32_t> FuncSymIndex =
-          this->getSymbolIndexesForFunctionAddress(AM.getFunctionAddress(),
-                                                   FunctionSec);
-      std::string FuncName = "<?>";
-      if (FuncSymIndex.empty())
-        this->reportUniqueWarning(
-            "could not identify function symbol for address (0x" +
-            Twine::utohexstr(AM.getFunctionAddress()) + ") in " +
-            this->describe(*Sec));
-      else
-        FuncName = this->getStaticSymbolName(FuncSymIndex.front());
-      W.printString("Name", FuncName);
-      {
-        ListScope BBRL(W, "BB Ranges");
-        for (const BBAddrMap::BBRangeEntry &BBR : AM.BBRanges) {
-          DictScope BBRD(W);
-          W.printHex("Base Address", BBR.BaseAddress);
-          ListScope BBEL(W, "BB Entries");
-          for (const BBAddrMap::BBEntry &BBE : BBR.BBEntries) {
-            DictScope BBED(W);
-            W.printNumber("ID", BBE.ID);
-            W.printHex("Offset", BBE.Offset);
-            if (!BBE.CallsiteEndOffsets.empty())
-              W.printList("Callsite End Offsets", BBE.CallsiteEndOffsets);
-            if (PAM.FeatEnable.BBHash)
-              W.printHex("Hash", BBE.Hash);
-            W.printHex("Size", BBE.Size);
-            W.printBoolean("HasReturn", BBE.hasReturn());
-            W.printBoolean("HasTailCall", BBE.hasTailCall());
-            W.printBoolean("IsEHPad", BBE.isEHPad());
-            W.printBoolean("CanFallThrough", BBE.canFallThrough());
-            W.printBoolean("HasIndirectBranch", BBE.hasIndirectBranch());
-          }
+      const BBAddrMap &Map = AM;
+      const Elf_Shdr *SecPtr = Sec;
+      printBBAddrMapFunction(W, AM, PAM, PrettyPGOAnalysis, [&]() -> std::string {
+        SmallVector<uint32_t> FuncSymIndex =
+            this->getSymbolIndexesForFunctionAddress(Map.getFunctionAddress(),
+                                                     FunctionSec);
+        if (FuncSymIndex.empty()) {
+          this->reportUniqueWarning(
+              "could not identify function symbol for address (0x" +
+              Twine::utohexstr(Map.getFunctionAddress()) + ") in " +
+              this->describe(*SecPtr));
+          return "<?>";
         }
-      }
-
-      if (PAM.FeatEnable.hasPGOAnalysis()) {
-        DictScope PD(W, "PGO analyses");
-
-        if (PAM.FeatEnable.FuncEntryCount)
-          W.printNumber("FuncEntryCount", PAM.FuncEntryCount);
-
-        if (PAM.FeatEnable.hasPGOAnalysisBBData()) {
-          ListScope L(W, "PGO BB entries");
-          for (const PGOAnalysisMap::PGOBBEntry &PBBE : PAM.BBEntries) {
-            DictScope L(W);
-
-            if (PAM.FeatEnable.BBFreq) {
-              if (PrettyPGOAnalysis) {
-                std::string BlockFreqStr;
-                raw_string_ostream SS(BlockFreqStr);
-                printRelativeBlockFreq(SS, PAM.BBEntries.front().BlockFreq,
-                                       PBBE.BlockFreq);
-                W.printString("Frequency", BlockFreqStr);
-              } else {
-                W.printNumber("Frequency", PBBE.BlockFreq.getFrequency());
-              }
-              if (PAM.FeatEnable.PostLinkCfg)
-                W.printNumber("PostLink Frequency", PBBE.PostLinkBlockFreq);
-            }
-
-            if (PAM.FeatEnable.BrProb) {
-              ListScope L(W, "Successors");
-              for (const auto &Succ : PBBE.Successors) {
-                DictScope L(W);
-                W.printNumber("ID", Succ.ID);
-                if (PrettyPGOAnalysis) {
-                  W.printObject("Probability", Succ.Prob);
-                } else {
-                  W.printHex("Probability", Succ.Prob.getNumerator());
-                }
-                if (PAM.FeatEnable.PostLinkCfg)
-                  W.printNumber("PostLink Probability", Succ.PostLinkFreq);
-              }
-            }
-          }
-        }
-      }
+        return this->getStaticSymbolName(FuncSymIndex.front());
+      });
     }
   }
 }

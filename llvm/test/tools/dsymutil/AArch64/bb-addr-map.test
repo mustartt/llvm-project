@@ -1,0 +1,100 @@
+## Test that dsymutil gathers the __LLVM,__llvm_bbaddrmap section from the
+## debug-map objects (the linker drops it from the final image, like
+## __remarks), relinks each function address to its final linked address, and
+## writes the concatenated result to a sidecar file in the dSYM bundle.
+
+# REQUIRES: host-byteorder-little-endian
+
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: split-file %s %t
+
+## Build the debug-map object with a bbaddrmap. In the object the function
+## address is 0 and carries a relocation to _foo.
+# RUN: llc -mtriple=arm64-apple-darwin -basic-block-address-map \
+# RUN:     -pgo-analysis-map=all -filetype=obj %t/foo.ll -o %t/foo.o
+
+## Build a minimal linked executable to act as the debug map's binary.
+# RUN: yaml2obj %t/exe.yaml -o %t/a.out
+
+## Point the debug map at the freshly built binary and link.
+# RUN: sed -e "s@BINARY@%t/a.out@" %t/map.yaml.in > %t/map.yaml
+# RUN: dsymutil --linker classic -y %t/map.yaml -oso-prepend-path=%t -o %t/out.dSYM
+# RUN: xxd -p %t/out.dSYM/Contents/Resources/BBAddrMap/a.out | FileCheck %s
+# RUN: dsymutil --linker parallel -y %t/map.yaml -oso-prepend-path=%t -o %t/out.dSYM
+# RUN: xxd -p %t/out.dSYM/Contents/Resources/BBAddrMap/a.out | FileCheck %s
+
+## version(05) feature(2700) then the 8-byte function address relinked to the
+## debug map's binAddr for _foo (0x0000000100004000, little-endian), which is
+## 0 in the input object.
+# CHECK: 05270000400000010000000300000008
+
+#--- foo.ll
+define i32 @foo(i32 %x) {
+entry:
+  %c = icmp sgt i32 %x, 0
+  br i1 %c, label %a, label %b
+a:
+  %r = call i32 @ext()
+  ret i32 %r
+b:
+  ret i32 2
+}
+declare i32 @ext()
+
+#--- map.yaml.in
+---
+triple:          'arm64-apple-darwin'
+binary-path:     'BINARY'
+objects:
+  - filename: foo.o
+    symbols:
+      - { sym: _foo, objAddr: 0x0, binAddr: 0x0000000100004000, size: 0x00000020 }
+...
+
+#--- exe.yaml
+--- !mach-o
+FileHeader:
+  magic:           0xFEEDFACF
+  cputype:         0x100000C
+  cpusubtype:      0x0
+  filetype:        0x2
+  ncmds:           3
+  sizeofcmds:      248
+  flags:           0x200085
+  reserved:        0x0
+LoadCommands:
+  - cmd:             LC_SEGMENT_64
+    cmdsize:         152
+    segname:         __TEXT
+    vmaddr:          4294967296
+    vmsize:          16384
+    fileoff:         0
+    filesize:        16384
+    maxprot:         5
+    initprot:        5
+    nsects:          1
+    flags:           0
+    Sections:
+      - sectname:        __text
+        segname:         __TEXT
+        addr:            0x100000410
+        size:            4
+        offset:          0x410
+        align:           2
+        reloff:          0x0
+        nreloc:          0
+        flags:           0x80000400
+        reserved1:       0x0
+        reserved2:       0x0
+        reserved3:       0x0
+        content:         C0035FD6
+  - cmd:             LC_SYMTAB
+    cmdsize:         24
+    symoff:          0
+    nsyms:           0
+    stroff:          0
+    strsize:         0
+  - cmd:             LC_UUID
+    cmdsize:         24
+    uuid:            B95C17E1-7B8C-362B-B402-C636C09BB979
+...

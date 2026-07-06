@@ -22,6 +22,7 @@
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/BinaryFormat/Swift.h"
+#include "llvm/Object/BBAddrMap.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/SymbolicFile.h"
@@ -453,6 +454,15 @@ public:
   uint64_t getSectionAlignment(DataRefImpl Sec) const override;
   Expected<SectionRef> getSection(unsigned SectionIndex) const;
   Expected<SectionRef> getSection(StringRef SectionName) const;
+
+  /// Returns a vector of BBAddrMap structs corresponding to each function
+  /// within the __LLVM,__llvm_bb_addr_map section. If the \p TextSectionIndex
+  /// is provided, only entries whose function symbol is defined in the text
+  /// section with that index are returned. When \p PGOAnalyses is provided, the
+  /// vector is filled with PGO data (parallel to the returned BBAddrMaps).
+  Expected<std::vector<BBAddrMap>>
+  readBBAddrMap(std::optional<unsigned> TextSectionIndex = std::nullopt,
+                std::vector<PGOAnalysisMap> *PGOAnalyses = nullptr) const;
   bool isSectionCompressed(DataRefImpl Sec) const override;
   bool isSectionText(DataRefImpl Sec) const override;
   bool isSectionData(DataRefImpl Sec) const override;

@@ -541,6 +541,8 @@ static void dumpObject(ObjectFile &Obj, ScopedPrinter &Writer,
       Dumper->printMachODysymtab();
     if (opts::CGProfile)
       Dumper->printCGProfile();
+    if (opts::BBAddrMap)
+      Dumper->printBBAddrMaps(opts::PrettyPGOAnalysisMap);
   }
 
   if (Obj.isXCOFF()) {

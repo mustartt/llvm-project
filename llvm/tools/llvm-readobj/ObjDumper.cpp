@@ -14,10 +14,12 @@
 #include "ObjDumper.h"
 #include "llvm-readobj.h"
 #include "llvm/Object/Archive.h"
+#include "llvm/Object/BBAddrMap.h"
 #include "llvm/Object/Decompressor.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/OffloadBinary.h"
 #include "llvm/Object/OffloadBundle.h"
+#include "llvm/Support/BlockFrequency.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/ScopedPrinter.h"
@@ -28,6 +30,86 @@ namespace llvm {
 
 static inline Error createError(const Twine &Msg) {
   return createStringError(object::object_error::parse_failed, Msg);
+}
+
+void printBBAddrMapFunction(ScopedPrinter &W, const object::BBAddrMap &AM,
+                            const object::PGOAnalysisMap &PAM,
+                            bool PrettyPGOAnalysis,
+                            function_ref<std::string()> GetFunctionName) {
+  using namespace object;
+  DictScope D(W, "Function");
+  W.printHex("At", AM.getFunctionAddress());
+  // Resolve the name after printing the address so that any diagnostics emitted
+  // during resolution are ordered consistently with the printed output.
+  W.printString("Name", GetFunctionName());
+  {
+    ListScope BBRL(W, "BB Ranges");
+    for (const BBAddrMap::BBRangeEntry &BBR : AM.BBRanges) {
+      DictScope BBRD(W);
+      W.printHex("Base Address", BBR.BaseAddress);
+      ListScope BBEL(W, "BB Entries");
+      for (const BBAddrMap::BBEntry &BBE : BBR.BBEntries) {
+        DictScope BBED(W);
+        W.printNumber("ID", BBE.ID);
+        W.printHex("Offset", BBE.Offset);
+        if (!BBE.CallsiteEndOffsets.empty())
+          W.printList("Callsite End Offsets", BBE.CallsiteEndOffsets);
+        if (PAM.FeatEnable.BBHash)
+          W.printHex("Hash", BBE.Hash);
+        W.printHex("Size", BBE.Size);
+        W.printBoolean("HasReturn", BBE.hasReturn());
+        W.printBoolean("HasTailCall", BBE.hasTailCall());
+        W.printBoolean("IsEHPad", BBE.isEHPad());
+        W.printBoolean("CanFallThrough", BBE.canFallThrough());
+        W.printBoolean("HasIndirectBranch", BBE.hasIndirectBranch());
+      }
+    }
+  }
+
+  if (!PAM.FeatEnable.hasPGOAnalysis())
+    return;
+
+  DictScope PD(W, "PGO analyses");
+
+  if (PAM.FeatEnable.FuncEntryCount)
+    W.printNumber("FuncEntryCount", PAM.FuncEntryCount);
+
+  if (!PAM.FeatEnable.hasPGOAnalysisBBData())
+    return;
+
+  ListScope L(W, "PGO BB entries");
+  for (const PGOAnalysisMap::PGOBBEntry &PBBE : PAM.BBEntries) {
+    DictScope L(W);
+
+    if (PAM.FeatEnable.BBFreq) {
+      if (PrettyPGOAnalysis) {
+        std::string BlockFreqStr;
+        raw_string_ostream SS(BlockFreqStr);
+        printRelativeBlockFreq(SS, PAM.BBEntries.front().BlockFreq,
+                               PBBE.BlockFreq);
+        W.printString("Frequency", BlockFreqStr);
+      } else {
+        W.printNumber("Frequency", PBBE.BlockFreq.getFrequency());
+      }
+      if (PAM.FeatEnable.PostLinkCfg)
+        W.printNumber("PostLink Frequency", PBBE.PostLinkBlockFreq);
+    }
+
+    if (PAM.FeatEnable.BrProb) {
+      ListScope L(W, "Successors");
+      for (const auto &Succ : PBBE.Successors) {
+        DictScope L(W);
+        W.printNumber("ID", Succ.ID);
+        if (PrettyPGOAnalysis) {
+          W.printObject("Probability", Succ.Prob);
+        } else {
+          W.printHex("Probability", Succ.Prob.getNumerator());
+        }
+        if (PAM.FeatEnable.PostLinkCfg)
+          W.printNumber("PostLink Probability", Succ.PostLinkFreq);
+      }
+    }
+  }
 }
 
 ObjDumper::ObjDumper(ScopedPrinter &Writer, StringRef ObjName) : W(Writer) {

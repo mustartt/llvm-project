@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -5480,4 +5481,126 @@ bool MachOObjectFile::isMachOPairedReloc(uint64_t RelocType, uint64_t Arch) {
   default:
     return false;
   }
+}
+
+namespace {
+/// Resolves function/base addresses in a MachO __llvm_bb_addr_map section.
+///
+/// In a relocatable object the pointer-sized address fields are zero (or hold
+/// an addend) and carry a relocation to the function symbol. This extractor
+/// applies those relocations. In a fully-linked image there are no relocations
+/// and the stored value is the final address.
+class MachOBBAddrMapAddressExtractor : public object::AddressExtractor {
+  // Maps a section offset that carries a relocation to the resolved value of
+  // the referenced symbol.
+  const DenseMap<uint64_t, uint64_t> &OffsetToSymbolAddress;
+  // Maps a section offset that carries a relocation to the index of the section
+  // that defines the referenced symbol.
+  const DenseMap<uint64_t, unsigned> &OffsetToSectionIndex;
+
+public:
+  // Maps a resolved address back to the section that defines it. Used to
+  // associate a decoded function with its text section.
+  DenseMap<uint64_t, unsigned> AddressToSectionIndex;
+
+  MachOBBAddrMapAddressExtractor(
+      const DataExtractor &Data, unsigned AddressSize,
+      const DenseMap<uint64_t, uint64_t> &OffsetToSymbolAddress,
+      const DenseMap<uint64_t, unsigned> &OffsetToSectionIndex)
+      : AddressExtractor(Data, AddressSize),
+        OffsetToSymbolAddress(OffsetToSymbolAddress),
+        OffsetToSectionIndex(OffsetToSectionIndex) {}
+
+  Expected<uint64_t> extractAddress(DataExtractor::Cursor &Cur) override {
+    uint64_t Offset = Cur.tell();
+    Expected<uint64_t> ValueOrErr = AddressExtractor::extractAddress(Cur);
+    if (!ValueOrErr)
+      return ValueOrErr.takeError();
+    auto It = OffsetToSymbolAddress.find(Offset);
+    if (It == OffsetToSymbolAddress.end())
+      return *ValueOrErr;
+    // The stored value acts as an addend on top of the symbol's address.
+    uint64_t Resolved = It->second + *ValueOrErr;
+    auto SecIt = OffsetToSectionIndex.find(Offset);
+    if (SecIt != OffsetToSectionIndex.end())
+      AddressToSectionIndex[Resolved] = SecIt->second;
+    return Resolved;
+  }
+};
+} // namespace
+
+Expected<std::vector<BBAddrMap>>
+MachOObjectFile::readBBAddrMap(std::optional<unsigned> TextSectionIndex,
+                              std::vector<PGOAnalysisMap> *PGOAnalyses) const {
+  std::vector<BBAddrMap> BBAddrMaps;
+  if (PGOAnalyses)
+    PGOAnalyses->clear();
+
+  for (const SectionRef &Sec : sections()) {
+    Expected<StringRef> NameOrErr = Sec.getName();
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
+      continue;
+    }
+    if (*NameOrErr != "__llvm_bbaddrmap")
+      continue;
+
+    Expected<StringRef> ContentsOrErr = Sec.getContents();
+    if (!ContentsOrErr)
+      return ContentsOrErr.takeError();
+
+    // Gather the section's relocations so the extractor can resolve the
+    // pointer-sized function/base addresses.
+    DenseMap<uint64_t, uint64_t> OffsetToSymbolAddress;
+    DenseMap<uint64_t, unsigned> OffsetToSectionIndex;
+    for (const RelocationRef &Reloc : Sec.relocations()) {
+      symbol_iterator SymIt = Reloc.getSymbol();
+      if (SymIt == symbol_end())
+        continue;
+      Expected<uint64_t> SymAddrOrErr = SymIt->getAddress();
+      if (!SymAddrOrErr)
+        return SymAddrOrErr.takeError();
+      uint64_t Offset = Reloc.getOffset();
+      OffsetToSymbolAddress[Offset] = *SymAddrOrErr;
+      Expected<section_iterator> SymSecOrErr = SymIt->getSection();
+      if (!SymSecOrErr)
+        return SymSecOrErr.takeError();
+      if (*SymSecOrErr != section_end())
+        OffsetToSectionIndex[Offset] = (*SymSecOrErr)->getIndex();
+    }
+
+    DataExtractor Data(*ContentsOrErr, isLittleEndian());
+    MachOBBAddrMapAddressExtractor Extractor(Data, getBytesInAddress(),
+                                             OffsetToSymbolAddress,
+                                             OffsetToSectionIndex);
+
+    std::vector<PGOAnalysisMap> SecPGOAnalyses;
+    Expected<std::vector<BBAddrMap>> BBAddrMapOrErr = decodeBBAddrMapPayload(
+        Extractor, PGOAnalyses ? &SecPGOAnalyses : nullptr);
+    if (!BBAddrMapOrErr)
+      return createError("unable to read BB addr map section: " +
+                         toString(BBAddrMapOrErr.takeError()));
+
+    for (size_t I = 0, E = BBAddrMapOrErr->size(); I != E; ++I) {
+      BBAddrMap &AM = (*BBAddrMapOrErr)[I];
+      // Filter to the requested text section, if any. The associated section is
+      // recovered from the relocation that resolved the function address.
+      if (TextSectionIndex) {
+        auto SecIt =
+            Extractor.AddressToSectionIndex.find(AM.getFunctionAddress());
+        if (SecIt == Extractor.AddressToSectionIndex.end() ||
+            SecIt->second != *TextSectionIndex)
+          continue;
+      }
+      BBAddrMaps.push_back(std::move(AM));
+      if (PGOAnalyses)
+        PGOAnalyses->push_back(std::move(SecPGOAnalyses[I]));
+    }
+  }
+
+  if (PGOAnalyses)
+    assert(PGOAnalyses->size() == BBAddrMaps.size() &&
+           "The same number of BBAddrMaps and PGOAnalysisMaps should be "
+           "returned when PGO information is requested");
+  return BBAddrMaps;
 }

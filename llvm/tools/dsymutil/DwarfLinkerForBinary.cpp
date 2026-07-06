@@ -60,6 +60,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/MachO.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Object/SymbolicFile.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
@@ -262,6 +263,95 @@ static Error emitRemarks(const LinkOptions &Options, StringRef BinaryPath,
   return Error::success();
 }
 
+// Emit the gathered, address-relinked __llvm_bbaddrmap contents to a sidecar
+// file inside the dSYM's Resources directory. Modeled after emitRemarks: the
+// linker drops the __LLVM,__llvm_bbaddrmap section from the final image, so the
+// map is collected from the debug-map objects and written out separately.
+static Error emitBBAddrMap(const LinkOptions &Options, StringRef BinaryPath,
+                           StringRef ArchName, StringRef Data) {
+  // Make sure we don't create the directories and the file if there is nothing
+  // to write.
+  if (Data.empty())
+    return Error::success();
+
+  SmallString<128> Path;
+  // Create the "BBAddrMap" directory in the "Resources" directory.
+  sys::path::append(Path, *Options.ResourceDir, "BBAddrMap");
+  if (std::error_code EC = sys::fs::create_directories(Path.str(), true,
+                                                       sys::fs::perms::all_all))
+    return errorCodeToError(EC);
+
+  // Append the file name.
+  // For fat binaries, also append a dash and the architecture name.
+  sys::path::append(Path, sys::path::filename(BinaryPath));
+  if (Options.NumDebugMaps > 1) {
+    // More than one debug map means we have a fat binary.
+    Path += '-';
+    Path += ArchName;
+  }
+
+  std::error_code EC;
+  raw_fd_ostream OS(Options.NoOutput ? "-" : Path.str(), EC, sys::fs::OF_None);
+  if (EC)
+    return errorCodeToError(EC);
+
+  OS << Data;
+
+  return Error::success();
+}
+
+void DwarfLinkerForBinary::collectBBAddrMap(const DebugMapObject &Obj,
+                                            const object::ObjectFile &Object) {
+  const auto *MO = dyn_cast<object::MachOObjectFile>(&Object);
+  if (!MO)
+    return;
+
+  for (const object::SectionRef &Section : MO->sections()) {
+    Expected<StringRef> NameOrErr = Section.getName();
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
+      continue;
+    }
+    if (*NameOrErr != "__llvm_bbaddrmap")
+      continue;
+
+    Expected<StringRef> ContentsOrErr = Section.getContents();
+    if (!ContentsOrErr) {
+      consumeError(ContentsOrErr.takeError());
+      continue;
+    }
+
+    // Copy the contents so we can relink the (relocated) function-address
+    // fields to their final addresses in the linked binary.
+    std::string Buf = ContentsOrErr->str();
+    for (const object::RelocationRef &Reloc : Section.relocations()) {
+      object::symbol_iterator SymIt = Reloc.getSymbol();
+      if (SymIt == MO->symbol_end())
+        continue;
+      Expected<StringRef> SymNameOrErr = SymIt->getName();
+      if (!SymNameOrErr) {
+        consumeError(SymNameOrErr.takeError());
+        continue;
+      }
+      // The function may be absent from the debug map (e.g. dead-stripped); in
+      // that case leave the entry's address as-is.
+      const auto *Entry = Obj.lookupSymbol(*SymNameOrErr);
+      if (!Entry)
+        continue;
+      uint64_t Offset = Reloc.getOffset();
+      if (Offset + sizeof(uint64_t) > Buf.size())
+        continue;
+      support::endian::write<uint64_t>(
+          &Buf[Offset], Entry->getValue().BinaryAddress,
+          MO->isLittleEndian() ? llvm::endianness::little
+                               : llvm::endianness::big);
+    }
+
+    std::lock_guard<std::mutex> Guard(BBAddrMapMutex);
+    BBAddrMapData += Buf;
+  }
+}
+
 ErrorOr<std::unique_ptr<DWARFFile>> DwarfLinkerForBinary::loadObject(
     const DebugMapObject &Obj, const DebugMap &DebugMap,
     remarks::RemarkLinker &RL,
@@ -296,6 +386,9 @@ ErrorOr<std::unique_ptr<DWARFFile>> DwarfLinkerForBinary::loadObject(
               return remarksErrorHandler(Obj, *this, std::move(EC));
             }))
       return errorToErrorCode(std::move(NewE));
+
+    // Gather and relink the basic-block address map from this object.
+    collectBBAddrMap(Obj, *ErrorOrObj);
 
     return std::move(Res);
   }
@@ -730,6 +823,9 @@ bool DwarfLinkerForBinary::linkImpl(
   }
 
   remarks::RemarkLinker RL;
+  // Reset the per-link basic-block address map accumulator (link() is invoked
+  // once per architecture for fat binaries).
+  BBAddrMapData.clear();
   if (!Options.RemarksPrependPath.empty())
     RL.setExternalFilePrependPath(Options.RemarksPrependPath);
   RL.setKeepAllRemarks(Options.RemarksKeepAll);
@@ -973,6 +1069,10 @@ bool DwarfLinkerForBinary::linkImpl(
 
   StringRef ArchName = Map.getTriple().getArchName();
   if (Error E = emitRemarks(Options, Map.getBinaryPath(), ArchName, RL))
+    return error(toString(std::move(E)));
+
+  if (Error E =
+          emitBBAddrMap(Options, Map.getBinaryPath(), ArchName, BBAddrMapData))
     return error(toString(std::move(E)));
 
   if (Options.NoOutput)
