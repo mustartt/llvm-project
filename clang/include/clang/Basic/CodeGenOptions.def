@@ -455,6 +455,11 @@ CODEGENOPT(StrictReturn, 1, 1, Benign)
 /// Whether emit pseudo probes for sample pgo profile collection.
 CODEGENOPT(PseudoProbeForProfiling, 1, 0, Benign)
 
+/// Whether to identify pseudo-probed functions by their stable GUID instead of
+/// relying on -funique-internal-linkage-names to disambiguate same-named
+/// internal-linkage functions.
+CODEGENOPT(PseudoProbeUseStableGUID, 1, 0, Benign)
+
 CODEGENOPT(NoPLT, 1, 0, Benign)
 
 /// Whether to emit all vtables

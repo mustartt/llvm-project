@@ -1947,6 +1947,14 @@ defm pseudo_probe_for_profiling
                   NegFlag<SetFalse, [], [ClangOption], "Do not emit">,
                   BothFlags<[], [ClangOption, CC1Option, CLOption, FlangOption, FC1Option],
                             " pseudo probes for sample profiling">>;
+defm pseudo_probe_use_stable_guid
+    : BoolFOption<"pseudo-probe-use-stable-guid",
+                  CodeGenOpts<"PseudoProbeUseStableGUID">, DefaultFalse,
+                  PosFlag<SetTrue, [], [ClangOption], "Use">,
+                  NegFlag<SetFalse, [], [ClangOption], "Do not use">,
+                  BothFlags<[], [ClangOption, CC1Option, CLOption, FlangOption, FC1Option],
+                            " stable GUIDs to identify pseudo-probed functions "
+                            "instead of -funique-internal-linkage-names">>;
 def fprofile_list_EQ : Joined<["-"], "fprofile-list=">,
     Group<f_Group>, Visibility<[ClangOption, CC1Option, CLOption]>,
     HelpText<"Filename defining the list of functions/files to instrument. "

@@ -7440,10 +7440,19 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     if (Args.hasFlag(options::OPT_fpseudo_probe_for_profiling,
                      options::OPT_fno_pseudo_probe_for_profiling, false)) {
       CmdArgs.push_back("-fpseudo-probe-for-profiling");
+      // With stable GUIDs, functions are disambiguated by their GUID rather
+      // than by a rewritten symbol name, so -funique-internal-linkage-names is
+      // neither needed nor wanted (it would mutate the symbol name).
+      bool UseStableGUID =
+          Args.hasFlag(options::OPT_fpseudo_probe_use_stable_guid,
+                       options::OPT_fno_pseudo_probe_use_stable_guid, false);
+      if (UseStableGUID)
+        CmdArgs.push_back("-fpseudo-probe-use-stable-guid");
       // Enforce -funique-internal-linkage-names if it's not explicitly turned
-      // off.
-      if (Args.hasFlag(options::OPT_funique_internal_linkage_names,
-                       options::OPT_fno_unique_internal_linkage_names, true))
+      // off, unless stable GUIDs are in use.
+      else if (Args.hasFlag(options::OPT_funique_internal_linkage_names,
+                            options::OPT_fno_unique_internal_linkage_names,
+                            true))
         CmdArgs.push_back("-funique-internal-linkage-names");
     }
   }
