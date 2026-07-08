@@ -25,7 +25,10 @@
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PseudoProbe.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
@@ -528,6 +531,15 @@ DIE &DwarfCompileUnit::updateSubprogramScopeDIE(const DISubprogram *SP,
         *SPDie, dwarf::DW_AT_LLVM_stmt_sequence, LineTableSym,
         Asm->getObjFileLowering().getDwarfLineSection()->getBeginSymbol());
   }
+
+  // For pseudo-probe/AutoFDO builds, stamp the function's GUID onto its
+  // subprogram DIE. This lets offline tools bind a probe GUID to a load
+  // address by reading GUID + DW_AT_low_pc straight from DWARF, instead of
+  // recomputing the GUID from the name (which collides for same-named
+  // internal-linkage functions across translation units).
+  if (F.getParent()->getNamedMetadata(PseudoProbeDescMetadataName))
+    addUInt(*SPDie, dwarf::DW_AT_LLVM_guid, dwarf::DW_FORM_data8,
+            F.getGUIDOrFallback());
 
   // Only include DW_AT_frame_base in full debug info
   if (!includeMinimalInlineScopes()) {
