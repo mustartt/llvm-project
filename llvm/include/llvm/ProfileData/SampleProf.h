@@ -43,6 +43,7 @@
 namespace llvm {
 
 class DILocation;
+class DISubprogram;
 class raw_ostream;
 
 LLVM_ABI const std::error_category &sampleprof_category();
@@ -992,6 +993,22 @@ public:
                         const HashKeyMap<DenseMap, FunctionId, FunctionId>
                             *FuncNameToProfNameMap = nullptr) const;
 
+  /// Returns a pointer to FunctionSamples at the given callsite location
+  /// \p Loc for the callee identified by the stable GUID \p Callee. Used when
+  /// the profile is keyed by stable GUIDs (see \p ProfileUsesStableGUID): the
+  /// callee GUID is looked up directly, bypassing name canonicalization so that
+  /// same-named internal-linkage callees are disambiguated.
+  const FunctionSamples *findFunctionSamplesAt(const LineLocation &Loc,
+                                               FunctionId Callee) const {
+    auto I = CallsiteSamples.find(mapIRLocToProfileLoc(Loc));
+    if (I == CallsiteSamples.end())
+      return nullptr;
+    auto FS = I->second.find(Callee);
+    if (FS != I->second.end())
+      return &FS->second;
+    return nullptr;
+  }
+
   bool empty() const { return TotalSamples == 0; }
 
   /// Return the total number of samples collected inside the function.
@@ -1322,7 +1339,9 @@ public:
   findFunctionSamples(const DILocation *DIL,
                       SampleProfileReaderItaniumRemapper *Remapper = nullptr,
                       const HashKeyMap<DenseMap, FunctionId, FunctionId>
-                          *FuncNameToProfNameMap = nullptr) const;
+                          *FuncNameToProfNameMap = nullptr,
+                      const DenseMap<const DISubprogram *, uint64_t>
+                          *ProbeGUIDs = nullptr) const;
 
   LLVM_ABI static bool ProfileIsProbeBased;
 

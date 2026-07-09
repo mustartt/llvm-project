@@ -309,20 +309,33 @@ LineLocation FunctionSamples::getCallSiteIdentifier(const DILocation *DIL,
 
 const FunctionSamples *FunctionSamples::findFunctionSamples(
     const DILocation *DIL, SampleProfileReaderItaniumRemapper *Remapper,
-    const HashKeyMap<DenseMap, FunctionId, FunctionId> *FuncNameToProfNameMap)
-    const {
+    const HashKeyMap<DenseMap, FunctionId, FunctionId> *FuncNameToProfNameMap,
+    const DenseMap<const DISubprogram *, uint64_t> *ProbeGUIDs) const {
   assert(DIL);
+  // In stable-GUID mode each inline frame is identified by the callee's stable
+  // GUID (read from its own block probe via \p ProbeGUIDs) rather than a name,
+  // so that same-named internal-linkage callees are disambiguated. Fall back to
+  // the name path when the GUID is unavailable (e.g. no surviving block probe).
+  bool UseStableGUID = ProfileUsesStableGUID && ProbeGUIDs;
+
   SmallVector<std::pair<LineLocation, StringRef>, 10> S;
+  SmallVector<uint64_t, 10> Guids;
 
   const DILocation *PrevDIL = DIL;
   for (DIL = DIL->getInlinedAt(); DIL; DIL = DIL->getInlinedAt()) {
+    const DISubprogram *SP = PrevDIL->getScope()->getSubprogram();
     // Use C++ linkage name if possible.
-    StringRef Name = PrevDIL->getScope()->getSubprogram()->getLinkageName();
+    StringRef Name = SP->getLinkageName();
     if (Name.empty())
-      Name = PrevDIL->getScope()->getSubprogram()->getName();
+      Name = SP->getName();
     S.emplace_back(FunctionSamples::getCallSiteIdentifier(
                        DIL, FunctionSamples::ProfileIsFS),
                    Name);
+    uint64_t Guid = 0;
+    if (UseStableGUID)
+      if (auto It = ProbeGUIDs->find(SP); It != ProbeGUIDs->end())
+        Guid = It->second;
+    Guids.push_back(Guid);
     PrevDIL = DIL;
   }
 
@@ -330,8 +343,11 @@ const FunctionSamples *FunctionSamples::findFunctionSamples(
     return this;
   const FunctionSamples *FS = this;
   for (int i = S.size() - 1; i >= 0 && FS != nullptr; i--) {
-    FS = FS->findFunctionSamplesAt(S[i].first, S[i].second, Remapper,
-                                   FuncNameToProfNameMap);
+    if (Guids[i])
+      FS = FS->findFunctionSamplesAt(S[i].first, FunctionId(Guids[i]));
+    else
+      FS = FS->findFunctionSamplesAt(S[i].first, S[i].second, Remapper,
+                                     FuncNameToProfNameMap);
   }
   return FS;
 }
