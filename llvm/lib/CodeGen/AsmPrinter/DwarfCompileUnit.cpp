@@ -533,11 +533,17 @@ DIE &DwarfCompileUnit::updateSubprogramScopeDIE(const DISubprogram *SP,
   }
 
   // For pseudo-probe/AutoFDO builds, stamp the function's GUID onto its
-  // subprogram DIE. This lets offline tools bind a probe GUID to a load
-  // address by reading GUID + DW_AT_low_pc straight from DWARF, instead of
-  // recomputing the GUID from the name (which collides for same-named
-  // internal-linkage functions across translation units).
-  if (F.getParent()->getNamedMetadata(PseudoProbeDescMetadataName))
+  // subprogram DIE so offline tools can bind a probe GUID to a load address by
+  // reading GUID + DW_AT_low_pc straight from DWARF. Only internal-linkage
+  // functions need this: their GUID depends on the module's source file name
+  // (MD5("sourcefile;name")), which is not recoverable from the debug name and
+  // collides for same-named statics across translation units. External-linkage
+  // GUIDs are MD5(name) and any consumer can recompute them from the name, so
+  // emitting the attribute for them would only waste space (this is also why
+  // stable GUIDs cost less than -funique-internal-linkage-names, which instead
+  // lengthens every internal symbol name).
+  if (F.hasLocalLinkage() &&
+      F.getParent()->getNamedMetadata(PseudoProbeDescMetadataName))
     addUInt(*SPDie, dwarf::DW_AT_LLVM_guid, dwarf::DW_FORM_data8,
             F.getGUIDOrFallback());
 
