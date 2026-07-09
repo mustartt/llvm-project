@@ -2425,8 +2425,10 @@ public:
   bool getKeyInstructionsEnabled() const { return SubclassData1; }
 
   /// The stable GUID assigned to this function (0 if unset). See the \c Guid
-  /// member. Not part of the node's uniquing key: it is stamped after creation
-  /// (by AssignGUIDPass) and mutated in place on distinct nodes.
+  /// member. It participates in the node's uniquing key (\c MDNodeKeyImpl), but
+  /// is stamped after creation by AssignGUIDPass, so \c setGuid only mutates
+  /// distinct nodes (subprogram definitions) -- never uniqued declarations,
+  /// whose key must stay stable.
   uint64_t getGuid() const { return Guid; }
   void setGuid(uint64_t G) {
     assert(isDistinct() && "Can only set GUID on a distinct DISubprogram");

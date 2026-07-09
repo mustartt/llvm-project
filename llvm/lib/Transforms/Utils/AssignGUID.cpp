@@ -35,9 +35,12 @@ void AssignGUIDPass::runOnModule(Module &M) {
     // and ThinLTO import (the subprogram is kept alive by inlined instructions
     // even after the callee Function is gone), letting probe emission and the
     // sample loader read an inlined callee frame's GUID straight from its
-    // DISubprogram instead of recomputing it from a name.
+    // DISubprogram instead of recomputing it from a name. Only stamp when unset
+    // so the pass stays idempotent and never clobbers a value already assigned
+    // (e.g. by a frontend, or a prior run).
     if (DISubprogram *SP = F.getSubprogram())
-      SP->setGuid(F.getGUIDOrFallback());
+      if (SP->getGuid() == 0)
+        SP->setGuid(F.getGUIDOrFallback());
   }
 }
 
