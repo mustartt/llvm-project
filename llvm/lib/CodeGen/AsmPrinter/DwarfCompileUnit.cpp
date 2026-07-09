@@ -28,7 +28,6 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/PseudoProbe.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
@@ -530,26 +529,6 @@ DIE &DwarfCompileUnit::updateSubprogramScopeDIE(const DISubprogram *SP,
     addSectionLabel(
         *SPDie, dwarf::DW_AT_LLVM_stmt_sequence, LineTableSym,
         Asm->getObjFileLowering().getDwarfLineSection()->getBeginSymbol());
-  }
-
-  // For pseudo-probe/AutoFDO builds, stamp the function's GUID onto its
-  // subprogram DIE so offline tools can bind a probe GUID to a load address by
-  // reading GUID + DW_AT_low_pc straight from DWARF. Only internal-linkage
-  // functions need this: their GUID depends on the module's source file name
-  // (MD5("sourcefile;name")), which is not recoverable from the debug name and
-  // collides for same-named statics across translation units. External-linkage
-  // GUIDs are MD5(name) and any consumer can recompute them from the name, so
-  // emitting the attribute for them would only waste space (this is also why
-  // stable GUIDs cost less than -funique-internal-linkage-names, which instead
-  // lengthens every internal symbol name).
-  //
-  // Prefer the GUID carried on the DISubprogram (stamped by AssignGUIDPass);
-  // it is the authoritative value that survives inlining/ThinLTO. Fall back to
-  // recomputing from the Function only when the field is unset.
-  if (F.hasLocalLinkage() &&
-      F.getParent()->getNamedMetadata(PseudoProbeDescMetadataName)) {
-    uint64_t Guid = SP->getGuid() ? SP->getGuid() : F.getGUIDOrFallback();
-    addUInt(*SPDie, dwarf::DW_AT_LLVM_guid, dwarf::DW_FORM_data8, Guid);
   }
 
   // Only include DW_AT_frame_base in full debug info
