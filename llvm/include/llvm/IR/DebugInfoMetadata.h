@@ -2290,6 +2290,14 @@ class DISubprogram : public DILocalScope {
   unsigned ScopeLine;
   unsigned VirtualIndex;
 
+  /// The stable GUID of the function, as assigned by AssignGUIDPass for
+  /// pseudo-probe/AutoFDO builds (MD5 of the global identifier). 0 when unset.
+  /// Carried on the subprogram so it survives inlining and ThinLTO import even
+  /// after the callee Function is gone -- the node's inlined instructions keep
+  /// it alive -- letting every consumer read the callee-frame GUID here instead
+  /// of recomputing it from a name (which collides for same-named statics).
+  uint64_t Guid = 0;
+
   /// In the MS ABI, the implicit 'this' parameter is adjusted in the prologue
   /// of method overrides from secondary bases by this amount. It may be
   /// negative.
@@ -2329,7 +2337,7 @@ private:
   DISubprogram(LLVMContext &C, StorageType Storage, unsigned Line,
                unsigned ScopeLine, unsigned VirtualIndex, int ThisAdjustment,
                DIFlags Flags, DISPFlags SPFlags, bool UsesKeyInstructions,
-               ArrayRef<Metadata *> Ops);
+               uint64_t Guid, ArrayRef<Metadata *> Ops);
   ~DISubprogram() = default;
 
   static DISubprogram *
@@ -2341,7 +2349,7 @@ private:
           DITemplateParameterArray TemplateParams, DISubprogram *Declaration,
           DINodeArray RetainedNodes, DITypeArray ThrownTypes,
           DINodeArray Annotations, StringRef TargetFuncName,
-          bool UsesKeyInstructions, StorageType Storage,
+          bool UsesKeyInstructions, uint64_t Guid, StorageType Storage,
           bool ShouldCreate = true) {
     return getImpl(Context, Scope, getCanonicalMDString(Context, Name),
                    getCanonicalMDString(Context, LinkageName), File, Line, Type,
@@ -2349,7 +2357,7 @@ private:
                    Flags, SPFlags, Unit, TemplateParams.get(), Declaration,
                    RetainedNodes.get(), ThrownTypes.get(), Annotations.get(),
                    getCanonicalMDString(Context, TargetFuncName),
-                   UsesKeyInstructions, Storage, ShouldCreate);
+                   UsesKeyInstructions, Guid, Storage, ShouldCreate);
   }
 
   LLVM_ABI static DISubprogram *
@@ -2359,7 +2367,7 @@ private:
           int ThisAdjustment, DIFlags Flags, DISPFlags SPFlags, Metadata *Unit,
           Metadata *TemplateParams, Metadata *Declaration,
           Metadata *RetainedNodes, Metadata *ThrownTypes, Metadata *Annotations,
-          MDString *TargetFuncName, bool UsesKeyInstructions,
+          MDString *TargetFuncName, bool UsesKeyInstructions, uint64_t Guid,
           StorageType Storage, bool ShouldCreate = true);
 
   TempDISubprogram cloneImpl() const {
@@ -2369,7 +2377,8 @@ private:
                         getThisAdjustment(), getFlags(), getSPFlags(),
                         getUnit(), getTemplateParams(), getDeclaration(),
                         getRetainedNodes(), getThrownTypes(), getAnnotations(),
-                        getTargetFuncName(), getKeyInstructionsEnabled());
+                        getTargetFuncName(), getKeyInstructionsEnabled(),
+                        getGuid());
   }
 
 public:
@@ -2382,11 +2391,12 @@ public:
        DITemplateParameterArray TemplateParams = nullptr,
        DISubprogram *Declaration = nullptr, DINodeArray RetainedNodes = nullptr,
        DITypeArray ThrownTypes = nullptr, DINodeArray Annotations = nullptr,
-       StringRef TargetFuncName = "", bool UsesKeyInstructions = false),
+       StringRef TargetFuncName = "", bool UsesKeyInstructions = false,
+       uint64_t Guid = 0),
       (Scope, Name, LinkageName, File, Line, Type, ScopeLine, ContainingType,
        VirtualIndex, ThisAdjustment, Flags, SPFlags, Unit, TemplateParams,
        Declaration, RetainedNodes, ThrownTypes, Annotations, TargetFuncName,
-       UsesKeyInstructions))
+       UsesKeyInstructions, Guid))
 
   DEFINE_MDNODE_GET(
       DISubprogram,
@@ -2397,11 +2407,11 @@ public:
        Metadata *TemplateParams = nullptr, Metadata *Declaration = nullptr,
        Metadata *RetainedNodes = nullptr, Metadata *ThrownTypes = nullptr,
        Metadata *Annotations = nullptr, MDString *TargetFuncName = nullptr,
-       bool UsesKeyInstructions = false),
+       bool UsesKeyInstructions = false, uint64_t Guid = 0),
       (Scope, Name, LinkageName, File, Line, Type, ScopeLine, ContainingType,
        VirtualIndex, ThisAdjustment, Flags, SPFlags, Unit, TemplateParams,
        Declaration, RetainedNodes, ThrownTypes, Annotations, TargetFuncName,
-       UsesKeyInstructions))
+       UsesKeyInstructions, Guid))
 
   TempDISubprogram clone() const { return cloneImpl(); }
 
@@ -2413,6 +2423,15 @@ public:
   }
 
   bool getKeyInstructionsEnabled() const { return SubclassData1; }
+
+  /// The stable GUID assigned to this function (0 if unset). See the \c Guid
+  /// member. Not part of the node's uniquing key: it is stamped after creation
+  /// (by AssignGUIDPass) and mutated in place on distinct nodes.
+  uint64_t getGuid() const { return Guid; }
+  void setGuid(uint64_t G) {
+    assert(isDistinct() && "Can only set GUID on a distinct DISubprogram");
+    Guid = G;
+  }
 
 public:
   unsigned getLine() const { return Line; }

@@ -1990,7 +1990,7 @@ Error MetadataLoader::MetadataLoaderImpl::parseOneMetadata(
     break;
   }
   case bitc::METADATA_SUBPROGRAM: {
-    if (Record.size() < 18 || Record.size() > 22)
+    if (Record.size() < 18 || Record.size() > 23)
       return error("Invalid record");
 
     bool HasSPFlags = Record[0] & 4;
@@ -2059,6 +2059,8 @@ Error MetadataLoader::MetadataLoaderImpl::parseOneMetadata(
       HasTargetFuncName = Record.size() >= 20;
       UsesKeyInstructions = Record.size() >= 21 ? Record[20] : 0;
     }
+    // The stable GUID (index 21) is only present in newer bitcode; default 0.
+    uint64_t Guid = Record.size() >= 22 ? Record[21] : 0;
 
     Metadata *CUorFn = getMDOrNull(Record[12 + OffsetB]);
     DISubprogram *SP = GET_OR_DISTINCT(
@@ -2086,7 +2088,7 @@ Error MetadataLoader::MetadataLoaderImpl::parseOneMetadata(
                         : nullptr, // annotations
          HasTargetFuncName ? getMDString(Record[19 + OffsetB])
                            : nullptr, // targetFuncName
-         UsesKeyInstructions));
+         UsesKeyInstructions, Guid));
     MetadataList.assignValue(SP, NextMetadataNo);
     NextMetadataNo++;
 

@@ -2476,6 +2476,8 @@ static void writeDISubprogram(raw_ostream &Out, const DISubprogram *N,
   Printer.printMetadata("annotations", N->getRawAnnotations());
   Printer.printString("targetFuncName", N->getTargetFuncName());
   Printer.printBool("keyInstructions", N->getKeyInstructionsEnabled(), false);
+  // Only print a nonzero GUID (stamped by AssignGUIDPass); 0 means unset.
+  Printer.printInt("guid", N->getGuid());
   Out << ")";
 }
 

@@ -542,10 +542,15 @@ DIE &DwarfCompileUnit::updateSubprogramScopeDIE(const DISubprogram *SP,
   // emitting the attribute for them would only waste space (this is also why
   // stable GUIDs cost less than -funique-internal-linkage-names, which instead
   // lengthens every internal symbol name).
+  //
+  // Prefer the GUID carried on the DISubprogram (stamped by AssignGUIDPass);
+  // it is the authoritative value that survives inlining/ThinLTO. Fall back to
+  // recomputing from the Function only when the field is unset.
   if (F.hasLocalLinkage() &&
-      F.getParent()->getNamedMetadata(PseudoProbeDescMetadataName))
-    addUInt(*SPDie, dwarf::DW_AT_LLVM_guid, dwarf::DW_FORM_data8,
-            F.getGUIDOrFallback());
+      F.getParent()->getNamedMetadata(PseudoProbeDescMetadataName)) {
+    uint64_t Guid = SP->getGuid() ? SP->getGuid() : F.getGUIDOrFallback();
+    addUInt(*SPDie, dwarf::DW_AT_LLVM_guid, dwarf::DW_FORM_data8, Guid);
+  }
 
   // Only include DW_AT_frame_base in full debug info
   if (!includeMinimalInlineScopes()) {

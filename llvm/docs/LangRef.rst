@@ -7084,6 +7084,14 @@ with an ODR ``identifier:`` and that does not set ``flags: DIFwdDecl``, then
 the subprogram declaration is uniqued based only on its ``linkageName:`` and
 ``scope:``.
 
+The optional ``guid:`` field holds the function's stable GUID (an unsigned
+64-bit integer, ``MD5`` of the global identifier) as assigned by the
+``assign-guid`` pass for pseudo-probe / AutoFDO builds; it is 0 (and omitted)
+when unset. It is carried on the subprogram so that it survives inlining and
+ThinLTO import even after the callee function is removed, allowing consumers to
+identify an inlined callee frame by its GUID rather than recomputing it from the
+name (which collides for same-named internal-linkage functions).
+
 .. code-block:: text
 
     define void @_Z3foov() !dbg !0 {

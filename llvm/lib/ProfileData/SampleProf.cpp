@@ -309,14 +309,15 @@ LineLocation FunctionSamples::getCallSiteIdentifier(const DILocation *DIL,
 
 const FunctionSamples *FunctionSamples::findFunctionSamples(
     const DILocation *DIL, SampleProfileReaderItaniumRemapper *Remapper,
-    const HashKeyMap<DenseMap, FunctionId, FunctionId> *FuncNameToProfNameMap,
-    const DenseMap<const DISubprogram *, uint64_t> *ProbeGUIDs) const {
+    const HashKeyMap<DenseMap, FunctionId, FunctionId> *FuncNameToProfNameMap)
+    const {
   assert(DIL);
   // In stable-GUID mode each inline frame is identified by the callee's stable
-  // GUID (read from its own block probe via \p ProbeGUIDs) rather than a name,
-  // so that same-named internal-linkage callees are disambiguated. Fall back to
-  // the name path when the GUID is unavailable (e.g. no surviving block probe).
-  bool UseStableGUID = ProfileUsesStableGUID && ProbeGUIDs;
+  // GUID, read straight from its DISubprogram (stamped by AssignGUIDPass), so
+  // that same-named internal-linkage callees are disambiguated. Fall back to the
+  // name path when the GUID is unset (stable GUIDs not in use, or an older
+  // subprogram without the field).
+  bool UseStableGUID = ProfileUsesStableGUID;
 
   SmallVector<std::pair<LineLocation, StringRef>, 10> S;
   SmallVector<uint64_t, 10> Guids;
@@ -331,11 +332,7 @@ const FunctionSamples *FunctionSamples::findFunctionSamples(
     S.emplace_back(FunctionSamples::getCallSiteIdentifier(
                        DIL, FunctionSamples::ProfileIsFS),
                    Name);
-    uint64_t Guid = 0;
-    if (UseStableGUID)
-      if (auto It = ProbeGUIDs->find(SP); It != ProbeGUIDs->end())
-        Guid = It->second;
-    Guids.push_back(Guid);
+    Guids.push_back(UseStableGUID ? SP->getGuid() : 0);
     PrevDIL = DIL;
   }
 

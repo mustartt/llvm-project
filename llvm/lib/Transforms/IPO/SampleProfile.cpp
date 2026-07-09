@@ -573,14 +573,6 @@ protected:
   // all the function symbols defined or declared in current module.
   DenseMap<uint64_t, StringRef> GUIDToFuncNameMap;
 
-  // Maps each DISubprogram to the stable GUID carried by its own block pseudo
-  // probes. In stable-GUID mode this lets the inline-stack walk identify an
-  // inlined callee frame by its authoritative GUID (which travels with the
-  // inlined body and its probes) rather than by hashing the debug name, so
-  // that same-named internal-linkage callees are disambiguated. Empty when the
-  // profile is not keyed by stable GUIDs.
-  DenseMap<const DISubprogram *, uint64_t> ProbeGUIDs;
-
   // All the Names used in FunctionSamples including outline function
   // names, inline instance names and call target names.
   StringSet<> NamesInProfile;
@@ -798,7 +790,7 @@ SampleProfileLoader::findFunctionSamples(const Instruction &Inst) const {
       it.first->second = ContextTracker->getContextSamplesFor(DIL);
     else
       it.first->second = Samples->findFunctionSamples(
-          DIL, Reader->getRemapper(), &FuncNameToProfNameMap, &ProbeGUIDs);
+          DIL, Reader->getRemapper(), &FuncNameToProfNameMap);
   }
   return it.first->second;
 }
@@ -2185,22 +2177,6 @@ bool SampleProfileLoader::runOnModule(Module &M, ModuleAnalysisManager &AM,
     return false;
 
   auto Remapper = Reader->getRemapper();
-  // In stable-GUID mode, build the DISubprogram -> GUID map from every block
-  // pseudo probe in the module (including probes of inlined callees, which
-  // travel with the inlined body). The inline-stack walk uses it to identify
-  // inlined callee frames by their stable GUID. Cheap and skipped otherwise.
-  if (FunctionSamples::ProfileIsProbeBased &&
-      FunctionSamples::ProfileUsesStableGUID) {
-    for (const Function &F : M)
-      for (const BasicBlock &BB : F)
-        for (const Instruction &I : BB)
-          if (const auto *Probe = dyn_cast<PseudoProbeInst>(&I))
-            if (const DILocation *DL = Probe->getDebugLoc())
-              if (const DISubprogram *SP = DL->getScope()->getSubprogram())
-                ProbeGUIDs.try_emplace(
-                    SP, Probe->getFuncGuid()->getZExtValue());
-  }
-
   // Populate the symbol map.
   for (const auto &N_F : M.getValueSymbolTable()) {
     StringRef OrigName = N_F.getKey();
@@ -2264,8 +2240,6 @@ bool SampleProfileLoader::runOnModule(Module &M, ModuleAnalysisManager &AM,
     if (auto *FuncInfo = M.getNamedMetadata(PseudoProbeDescMetadataName))
       M.eraseNamedMetadata(FuncInfo);
   }
-
-  ProbeGUIDs.clear();
 
   return retval;
 }

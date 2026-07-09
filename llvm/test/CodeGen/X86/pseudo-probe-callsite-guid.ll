@@ -1,7 +1,8 @@
 ; Check that PseudoProbeInserter reads a callsite probe's owner GUID from the
-; containing function's own block probe, instead of recomputing MD5(name).
-; The entry block probe below carries GUID 1234, which is deliberately NOT
-; MD5("foo"); the synthesized call probe must copy 1234, not the name hash.
+; containing function's DISubprogram (its `guid` field, stamped by
+; AssignGUIDPass), instead of recomputing MD5(name). The subprogram below
+; carries GUID 1234, which is deliberately NOT MD5("foo"); the synthesized call
+; probe must copy 1234, not the name hash.
 
 ; REQUIRES: x86-registered-target
 ; RUN: llc -mtriple=x86_64-unknown-unknown -stop-after=pseudo-probe-inserter %s -o - | FileCheck %s
@@ -30,7 +31,7 @@ declare void @llvm.pseudoprobe(i64, i64, i32, i64)
 !2 = !{i32 7, !"Dwarf Version", i32 5}
 !3 = !{i32 2, !"Debug Info Version", i32 3}
 !14 = !{i64 1234, i64 281479271677951, !"foo"}
-!15 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 3, type: !16, scopeLine: 3, spFlags: DISPFlagDefinition, unit: !0)
+!15 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 3, type: !16, scopeLine: 3, spFlags: DISPFlagDefinition, unit: !0, guid: 1234)
 !16 = !DISubroutineType(types: !17)
 !17 = !{!18, !18}
 !18 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)

@@ -14,6 +14,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Utils/AssignGUID.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 
 using namespace llvm;
@@ -28,6 +31,13 @@ void AssignGUIDPass::runOnModule(Module &M) {
     if (F.isDeclaration())
       continue;
     F.assignGUID();
+    // Mirror the GUID onto the function's DISubprogram so it survives inlining
+    // and ThinLTO import (the subprogram is kept alive by inlined instructions
+    // even after the callee Function is gone), letting probe emission and the
+    // sample loader read an inlined callee frame's GUID straight from its
+    // DISubprogram instead of recomputing it from a name.
+    if (DISubprogram *SP = F.getSubprogram())
+      SP->setGuid(F.getGUIDOrFallback());
   }
 }
 

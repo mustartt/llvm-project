@@ -43,7 +43,6 @@
 namespace llvm {
 
 class DILocation;
-class DISubprogram;
 class raw_ostream;
 
 LLVM_ABI const std::error_category &sampleprof_category();
@@ -1349,9 +1348,7 @@ public:
   findFunctionSamples(const DILocation *DIL,
                       SampleProfileReaderItaniumRemapper *Remapper = nullptr,
                       const HashKeyMap<DenseMap, FunctionId, FunctionId>
-                          *FuncNameToProfNameMap = nullptr,
-                      const DenseMap<const DISubprogram *, uint64_t>
-                          *ProbeGUIDs = nullptr) const;
+                          *FuncNameToProfNameMap = nullptr) const;
 
   LLVM_ABI static bool ProfileIsProbeBased;
 

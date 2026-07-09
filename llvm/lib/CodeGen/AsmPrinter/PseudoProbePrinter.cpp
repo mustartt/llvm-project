@@ -41,34 +41,9 @@ static cl::opt<bool> VerifyGuidExistence(
     cl::Hidden, cl::init(false));
 #endif
 
-void PseudoProbeHandler::buildProbeGuidMap() {
-  const MachineFunction *MF = Asm->MF;
-  if (MF == ProbeGuidMapMF)
-    return;
-  ProbeGuidMapMF = MF;
-  ProbeGuidMap.clear();
-  // A function's own block probes carry its authoritative GUID in operand 0
-  // (set by the prober, from the stable GUID when enabled). Key by the
-  // function's DISubprogram, which is the same node an InlinedAt frame resolves
-  // to. Only block probes are used: callsite probes are keyed by the callee but
-  // carry the caller's GUID, and would otherwise collide here.
-  for (const MachineBasicBlock &MBB : *MF)
-    for (const MachineInstr &MI : MBB) {
-      if (!MI.isPseudoProbe() ||
-          MI.getOperand(2).getImm() != (uint64_t)PseudoProbeType::Block)
-        continue;
-      const DILocation *DL = MI.getDebugLoc();
-      if (!DL)
-        continue;
-      if (const DISubprogram *SP = DL->getScope()->getSubprogram())
-        ProbeGuidMap.try_emplace(SP, MI.getOperand(0).getImm());
-    }
-}
-
 void PseudoProbeHandler::emitPseudoProbe(uint64_t Guid, uint64_t Index,
                                          uint64_t Type, uint64_t Attr,
                                          const DILocation *DebugLoc) {
-  buildProbeGuidMap();
   // Gather all the inlined-at nodes.
   // When it's done ReversedInlineStack looks like ([66, B], [88, A])
   // which means, Function A inlines function B at calliste with a probe id 88,
@@ -76,15 +51,13 @@ void PseudoProbeHandler::emitPseudoProbe(uint64_t Guid, uint64_t Index,
   SmallVector<InlineSite, 8> ReversedInlineStack;
   auto *InlinedAt = DebugLoc ? DebugLoc->getInlinedAt() : nullptr;
   while (InlinedAt) {
-    // Read the caller's GUID from its own block probe (found via its
-    // DISubprogram). This is consistent with the caller's own probes by
-    // construction and works across ThinLTO. Fall back to hashing the name when
-    // the caller has no surviving block probe (e.g. dangling-probe removal) or
-    // when stable GUIDs are not in use -- in the latter case the hash matches
-    // the map value anyway, so behavior is unchanged.
-    uint64_t CallerGuid = 0;
-    if (const DISubprogram *SP = InlinedAt->getScope()->getSubprogram())
-      CallerGuid = ProbeGuidMap.lookup(SP);
+    // Read the caller's GUID straight from its DISubprogram (stamped by
+    // AssignGUIDPass). The subprogram survives inlining/ThinLTO even when the
+    // caller Function is gone, so this is correct and needs no side table. Fall
+    // back to hashing the name when the GUID is unset (stable GUIDs not in use,
+    // in which case the hash matches anyway).
+    const DISubprogram *SP = InlinedAt->getScope()->getSubprogram();
+    uint64_t CallerGuid = SP ? SP->getGuid() : 0;
     if (!CallerGuid) {
       auto Name = InlinedAt->getSubprogramLinkageName();
       // Strip Coroutine suffixes from CoroSplit Pass, since pseudo probes are

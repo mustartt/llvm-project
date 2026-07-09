@@ -60,21 +60,6 @@ public:
       return false;
     const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
 
-    // A callsite probe carries the GUID of the function that contains the call.
-    // In stable-GUID mode that GUID is not derivable from the name, so read it
-    // from the containing function's own block probes (operand 0), keyed by
-    // DISubprogram. Build the map before synthesizing/removing any probes.
-    DenseMap<const DISubprogram *, uint64_t> ProbeGUIDs;
-    for (MachineBasicBlock &MBB : MF)
-      for (MachineInstr &MI : MBB) {
-        if (!MI.isPseudoProbe() ||
-            MI.getOperand(2).getImm() != (uint64_t)PseudoProbeType::Block)
-          continue;
-        if (DILocation *DL = MI.getDebugLoc())
-          if (const DISubprogram *SP = DL->getScope()->getSubprogram())
-            ProbeGUIDs.try_emplace(SP, MI.getOperand(0).getImm());
-      }
-
     bool Changed = false;
     for (MachineBasicBlock &MBB : MF) {
       MachineInstr *FirstInstr = nullptr;
@@ -88,7 +73,7 @@ public:
             auto Value = DL->getDiscriminator();
             if (DILocation::isPseudoProbeDiscriminator(Value)) {
               BuildMI(MBB, MI, DL, TII->get(TargetOpcode::PSEUDO_PROBE))
-                  .addImm(getFuncGUID(ProbeGUIDs, DL))
+                  .addImm(getFuncGUID(DL))
                   .addImm(
                       PseudoProbeDwarfDiscriminator::extractProbeIndex(Value))
                   .addImm(
@@ -155,15 +140,15 @@ public:
   }
 
 private:
-  uint64_t getFuncGUID(const DenseMap<const DISubprogram *, uint64_t> &ProbeGUIDs,
-                       DILocation *DL) {
-    // Prefer the authoritative GUID from the containing function's own block
-    // probe (correct under stable GUIDs and consistent with those probes).
+  uint64_t getFuncGUID(DILocation *DL) {
+    // Prefer the authoritative GUID carried on the containing function's
+    // DISubprogram (stamped by AssignGUIDPass). Correct under stable GUIDs and
+    // consistent with the function's own block probes.
     if (const DISubprogram *SP = DL->getScope()->getSubprogram())
-      if (auto It = ProbeGUIDs.find(SP); It != ProbeGUIDs.end())
-        return It->second;
-    // Fall back to hashing the name (default mode, or no surviving block probe
-    // for the containing function). Matches historical behavior.
+      if (uint64_t Guid = SP->getGuid())
+        return Guid;
+    // Fall back to hashing the name (default mode, or GUID unset). Matches
+    // historical behavior.
     auto Name = DL->getSubprogramLinkageName();
     // CoroSplit Pass will change the debug info with suffixes i.e. `.resume`,
     // `.destroy`, `.cleanup`. Strip these suffixes to make the GUID consistent

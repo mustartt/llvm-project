@@ -75,11 +75,14 @@ void SampleProfileMatcher::findIRAnchors(const Function &F,
   // Return the callee anchor identity. When the profile is keyed by stable
   // GUIDs, use the callee's GUID (which for internal-linkage functions is not
   // MD5(name)) so that it matches the GUID-keyed profile anchors; otherwise use
-  // the (canonical) name. For an inlined callsite we only have the callee name,
-  // so recover a same-named definition in the module to obtain its GUID.
-  auto CalleeAnchor = [M](const Function *Callee,
-                          StringRef Name) -> FunctionId {
+  // the (canonical) name. \p SP, when provided, is the callee's DISubprogram
+  // (for an inlined callsite): it carries the stable GUID directly and, unlike
+  // the callee Function, survives inlining/ThinLTO -- so prefer it.
+  auto CalleeAnchor = [M](const Function *Callee, StringRef Name,
+                          const DISubprogram *SP = nullptr) -> FunctionId {
     if (FunctionSamples::ProfileUsesStableGUID) {
+      if (SP && SP->getGuid())
+        return FunctionId(SP->getGuid());
       if (!Callee && !Name.empty() && Name != UnknownIndirectCallee)
         Callee = M->getFunction(Name);
       if (Callee)
@@ -103,7 +106,9 @@ void SampleProfileMatcher::findIRAnchors(const Function &F,
         LineLocation Callsite = FunctionSamples::getCallSiteIdentifier(
             DIL, FunctionSamples::ProfileIsFS);
         StringRef CalleeName = PrevDIL->getSubprogramLinkageName();
-        return std::make_pair(Callsite, CalleeAnchor(nullptr, CalleeName));
+        const DISubprogram *CalleeSP = PrevDIL->getScope()->getSubprogram();
+        return std::make_pair(Callsite,
+                              CalleeAnchor(nullptr, CalleeName, CalleeSP));
       };
 
   auto GetCanonicalCalleeAnchor =
