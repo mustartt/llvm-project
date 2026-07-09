@@ -183,8 +183,18 @@ public:
                      const MCPseudoProbe *LastProbe) const;
 };
 
-// Represents a callsite with caller function name and probe id
-using MCPseudoProbeFrameLocation = std::pair<StringRef, uint32_t>;
+// Represents a callsite with caller function name, caller GUID and probe id.
+// The GUID identifies the caller frame authoritatively; it is used instead of
+// the name when the profile is keyed by stable GUIDs (same-named
+// internal-linkage callers are otherwise indistinguishable by name).
+struct MCPseudoProbeFrameLocation {
+  StringRef Name;
+  uint64_t Guid;
+  uint32_t ProbeId;
+  MCPseudoProbeFrameLocation() = default;
+  MCPseudoProbeFrameLocation(StringRef Name, uint64_t Guid, uint32_t ProbeId)
+      : Name(Name), Guid(Guid), ProbeId(ProbeId) {}
+};
 
 class MCDecodedPseudoProbe : public MCPseudoProbeBase {
   uint64_t Address;

@@ -291,7 +291,7 @@ void MCDecodedPseudoProbe::getInlineContext(
   while (Cur->hasInlineSite()) {
     StringRef FuncName = getProbeFNameForGUID(GUID2FuncMAP, Cur->Parent->Guid);
     ContextStack.emplace_back(MCPseudoProbeFrameLocation(
-        FuncName, std::get<1>(Cur->getInlineSite())));
+        FuncName, Cur->Parent->Guid, std::get<1>(Cur->getInlineSite())));
     Cur = static_cast<MCDecodedPseudoProbeInlineTree *>(Cur->Parent);
   }
   // Make the ContextStack in caller-callee order
@@ -306,7 +306,7 @@ std::string MCDecodedPseudoProbe::getInlineContextStr(
   for (auto &Cxt : ContextStack) {
     if (OContextStr.str().size())
       OContextStr << " @ ";
-    OContextStr << Cxt.first.str() << ":" << Cxt.second;
+    OContextStr << Cxt.Name.str() << ":" << Cxt.ProbeId;
   }
   return OContextStr.str();
 }
@@ -753,8 +753,8 @@ void MCPseudoProbeDecoder::getInlineContextForProbe(
   // Note that the context from probe doesn't include leaf frame,
   // hence we need to retrieve and prepend leaf if requested.
   const auto *FuncDesc = getFuncDescForGUID(Probe->getGuid());
-  InlineContextStack.emplace_back(
-      MCPseudoProbeFrameLocation(FuncDesc->FuncName, Probe->getIndex()));
+  InlineContextStack.emplace_back(MCPseudoProbeFrameLocation(
+      FuncDesc->FuncName, Probe->getGuid(), Probe->getIndex()));
 }
 
 const MCPseudoProbeFuncDesc *MCPseudoProbeDecoder::getInlinerDescForProbe(

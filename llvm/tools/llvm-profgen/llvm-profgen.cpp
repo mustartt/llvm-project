@@ -74,6 +74,14 @@ static cl::opt<uint32_t>
               cl::desc("Process Id for the profiled executable binary."),
               cl::cat(ProfGenCategory));
 
+static cl::opt<bool> StableGUID(
+    "stable-guid", cl::init(false),
+    cl::desc("Emit a profile keyed by stable pseudo-probe GUIDs (as produced "
+             "with -fpseudo-probe-use-stable-guid). Same-named "
+             "internal-linkage functions are disambiguated by GUID rather than "
+             "by name. Sets SecFlagStableGUID in the output profile."),
+    cl::cat(ProfGenCategory));
+
 static cl::opt<std::string> DebugBinPath(
     "debug-binary", cl::value_desc("debug-binary"),
     cl::desc("Path of debug info binary, llvm-profgen will load the DWARF info "
@@ -184,6 +192,12 @@ int main(int argc, const char *argv[]) {
   cl::HideUnrelatedOptions({&ProfGenCategory, &getColorCategory()});
   cl::ParseCommandLineOptions(argc, argv, "llvm SPGO profile generator\n");
   validateCommandLine();
+
+  // Emit stable-GUID-keyed profiles when requested; the writer stamps
+  // SecFlagStableGUID and context frames are keyed by GUID (see
+  // ProfiledBinary::getInlineContextForProbe).
+  if (StableGUID)
+    FunctionSamples::ProfileUsesStableGUID = true;
 
   // Load symbols and disassemble the code of a given binary.
   std::unique_ptr<ProfiledBinary> Binary =

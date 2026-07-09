@@ -1,0 +1,20 @@
+; Check that llvm-profgen --stable-guid emits a probe-based profile keyed by
+; stable pseudo-probe GUIDs: every context frame is identified by its numeric
+; GUID (from the binary's .pseudo_probe inline forest) rather than by name, and
+; the output profile carries the SecFlagStableGUID summary flag.
+
+; RUN: llvm-profgen --format=extbinary --use-md5 --stable-guid \
+; RUN:   --perfscript=%S/Inputs/inline-cs-pseudoprobe.perfscript \
+; RUN:   --binary=%S/Inputs/inline-cs-pseudoprobe.perfbin --output=%t \
+; RUN:   --profile-summary-cold-count=0 --csspgo-preinliner=0 \
+; RUN:   --gen-cs-nested-profile=0
+; RUN: llvm-profdata show --sample --show-sec-info-only %t | FileCheck %s --check-prefix=SEC
+; RUN: llvm-profdata show --sample %t | FileCheck %s --check-prefix=PROF
+
+; The summary section advertises stable-GUID keying.
+; SEC: ProfileSummarySection {{.*}}Flags: {{{.*}}stable-guid{{.*}}}
+
+; Context frames are numeric GUIDs (main:2 @ foo:8 @ bar), not names.
+; PROF: Function: 15822663052811949562:2 @ 6699318081062747564:8 @ 16434608426314478903:
+; PROF-NOT: Function: main
+; PROF-NOT: Function: foo

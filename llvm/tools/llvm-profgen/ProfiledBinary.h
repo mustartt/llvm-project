@@ -671,15 +671,21 @@ public:
     SmallVector<MCPseudoProbeFrameLocation, 16> ProbeInlineContext;
     ProbeDecoder.getInlineContextForProbe(Probe, ProbeInlineContext,
                                           IncludeLeaf);
+    // In stable-GUID mode, key each frame by the caller's authoritative GUID
+    // rather than hashing its (possibly non-unique) name, so that same-named
+    // internal-linkage callers are disambiguated in the emitted profile.
+    bool UseStableGUID = FunctionSamples::ProfileUsesStableGUID;
     for (uint32_t I = 0; I < ProbeInlineContext.size(); I++) {
       auto &Callsite = ProbeInlineContext[I];
       // Clear the current context for an unknown probe.
-      if (Callsite.second == 0 && I != ProbeInlineContext.size() - 1) {
+      if (Callsite.ProbeId == 0 && I != ProbeInlineContext.size() - 1) {
         InlineContextStack.clear();
         continue;
       }
-      InlineContextStack.emplace_back(FunctionId(Callsite.first),
-                                      LineLocation(Callsite.second, 0));
+      FunctionId Func = UseStableGUID ? FunctionId(Callsite.Guid)
+                                      : FunctionId(Callsite.Name);
+      InlineContextStack.emplace_back(Func,
+                                      LineLocation(Callsite.ProbeId, 0));
     }
   }
   const AddressProbesMap &getAddress2ProbesMap() const {

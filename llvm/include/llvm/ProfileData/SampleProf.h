@@ -1295,6 +1295,12 @@ public:
   /// by looking up in the function map GUIDToFuncNameMap.
   /// If the original name doesn't exist in the map, return empty StringRef.
   StringRef getFuncName(FunctionId Func) const {
+    // A stable-GUID profile keys functions by their numeric GUID even in
+    // non-MD5 (textual) form, so there is no embedded string to return. Callers
+    // that need a printable label should consult the descriptor separately.
+    if (!Func.isStringRef())
+      return StringRef();
+
     if (!UseMD5)
       return Func.stringRef();
 

@@ -372,9 +372,12 @@ std::error_code SampleProfileWriterExtBinaryBase::writeNameTableSection(
   // so compiler won't strip the suffix during profile matching after
   // seeing the flag in the profile.
   // Original names are unavailable if using MD5, so this option has no use.
-  if (!UseMD5) {
+  // Stable-GUID profiles are keyed by numeric GUIDs (no embedded string) and
+  // retire the ".__uniq." mechanism entirely, so skip them too.
+  if (!UseMD5 && !FunctionSamples::ProfileUsesStableGUID) {
     for (const auto &I : NameTable) {
-      if (I.first.stringRef().contains(FunctionSamples::UniqSuffix)) {
+      if (I.first.isStringRef() &&
+          I.first.stringRef().contains(FunctionSamples::UniqSuffix)) {
         addSectionFlag(SecNameTable, SecNameTableFlags::SecFlagUniqSuffix);
         break;
       }

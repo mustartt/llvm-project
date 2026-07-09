@@ -1604,6 +1604,8 @@ static std::string getSecFlagsStr(const SecHdrTableEntry &Entry) {
       Flags.append("preInlined,");
     if (hasSecFlag(Entry, SecProfSummaryFlags::SecFlagFSDiscriminator))
       Flags.append("fs-discriminator,");
+    if (hasSecFlag(Entry, SecProfSummaryFlags::SecFlagStableGUID))
+      Flags.append("stable-guid,");
     break;
   case SecFuncOffsetTable:
     if (hasSecFlag(Entry, SecFuncOffsetFlags::SecFlagOrdered))
