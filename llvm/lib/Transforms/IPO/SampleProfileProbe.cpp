@@ -350,7 +350,17 @@ void SampleProfileProber::instrumentOneFunc(Function &F, TargetMachine *TM) {
     if (FName.empty())
       FName = SP->getName();
   }
-  uint64_t Guid = Function::getGUIDAssumingExternalLinkage(FName);
+  // When a stable GUID has been assigned (AssignGUIDPass has run and attached
+  // !guid metadata, i.e. -fpseudo-probe-use-stable-guid), identify the function
+  // by that GUID. This disambiguates same-named internal-linkage functions
+  // across translation units without -funique-internal-linkage-names. The GUID
+  // is stored in the probe descriptor keyed by FName, so the inline-tree
+  // emission (PseudoProbePrinter) reads back the same GUID for this function and
+  // stays consistent. Otherwise fall back to hashing the debug name (the
+  // historical behavior; getGUIDIfAssigned() returns nullopt when no !guid is
+  // present).
+  uint64_t Guid = F.getGUIDIfAssigned().value_or(
+      Function::getGUIDAssumingExternalLinkage(FName));
 
   // Assign an artificial debug line to a probe that doesn't come with a real
   // line. A probe not having a debug line will get an incomplete inline

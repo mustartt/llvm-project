@@ -517,6 +517,16 @@ public:
 
   /// Return the samples collected for function \p F.
   FunctionSamples *getSamplesFor(const Function &F) {
+    // When the profile is keyed by stable GUIDs, match by the function's GUID
+    // rather than its (possibly ambiguous) name. This is required for
+    // same-named internal-linkage functions built without
+    // -funique-internal-linkage-names.
+    if (FunctionSamples::ProfileUsesStableGUID) {
+      auto It = Profiles.find(FunctionId(F.getGUIDOrFallback()));
+      if (It != Profiles.end())
+        return &It->second;
+      return nullptr;
+    }
     // The function name may have been updated by adding suffix. Call
     // a helper to (optionally) strip off suffixes so that we can
     // match against the original function name in the profile.
@@ -1051,6 +1061,12 @@ protected:
 
   /// The set containing the functions to use when compiling a module.
   DenseSet<StringRef> FuncsToUse;
+
+  /// When the profile is keyed by stable GUIDs, the set of GUIDs of the
+  /// functions in the current module, used to look up their profiles in the
+  /// GUID-keyed FuncOffsetTable (the names in FuncsToUse do not hash to the
+  /// stable GUID for internal-linkage functions).
+  DenseSet<uint64_t> FuncGuidsToUse;
 
 public:
   SampleProfileReaderExtBinaryBase(std::unique_ptr<MemoryBuffer> B,

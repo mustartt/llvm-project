@@ -212,12 +212,15 @@ static cl::opt<bool> SampleMergeColdContext(
     "sample-merge-cold-context", cl::init(false), cl::Hidden,
     cl::sub(MergeSubcommand),
     cl::desc(
-        "Merge context sample profiles whose count is below cold threshold"));
-static cl::opt<bool> SampleTrimColdContext(
+        "Merge context sample profiles whose count is below cold threshold"));static cl::opt<bool> SampleTrimColdContext(
     "sample-trim-cold-context", cl::init(false), cl::Hidden,
     cl::sub(MergeSubcommand),
     cl::desc(
         "Trim context sample profiles whose count is below cold threshold"));
+static cl::opt<bool> SampleStableGUID(
+    "stable-guid", cl::init(false), cl::Hidden, cl::sub(MergeSubcommand),
+    cl::desc("Mark the output sample profile as keyed by stable GUIDs "
+             "(sets SecFlagStableGUID)"));
 static cl::opt<uint32_t> SampleColdContextFrameDepth(
     "sample-frame-depth-for-cold-context", cl::init(1),
     cl::sub(MergeSubcommand),
@@ -1685,6 +1688,10 @@ static void mergeSampleProfile(const WeightedFileVector &Inputs,
   }
 
   filterFunctions(ProfileMap);
+
+  // Testing/opt-in: mark the profile as keyed by stable GUIDs.
+  if (SampleStableGUID)
+    FunctionSamples::ProfileUsesStableGUID = true;
 
   auto WriterOrErr =
       SampleProfileWriter::create(OutputFilename, FormatMap[OutputFormat]);

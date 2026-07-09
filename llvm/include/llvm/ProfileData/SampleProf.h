@@ -204,6 +204,10 @@ enum class SecProfSummaryFlags : uint32_t {
   /// SecFlagFSDiscriminator means this profile uses flow-sensitive
   /// discriminators.
   SecFlagFSDiscriminator = (1 << 2),
+  /// SecFlagStableGUID means functions are keyed by their stable GUID
+  /// (getGUID()) rather than MD5(name), so same-named internal-linkage
+  /// functions across translation units are disambiguated without renaming.
+  SecFlagStableGUID = (1 << 3),
   /// SecFlagIsPreInlined means this profile contains ShouldBeInlined
   /// contexts thus this is CS preinliner computed.
   SecFlagIsPreInlined = (1 << 4),
@@ -1321,6 +1325,12 @@ public:
                           *FuncNameToProfNameMap = nullptr) const;
 
   LLVM_ABI static bool ProfileIsProbeBased;
+
+  /// Whether functions are keyed by their stable GUID (as assigned by
+  /// AssignGUIDPass / -fpseudo-probe-use-stable-guid) rather than by
+  /// MD5(name). When set, the loader matches IR functions to profile entries
+  /// via GlobalValue::getGUID() instead of hashing the name.
+  LLVM_ABI static bool ProfileUsesStableGUID;
 
   LLVM_ABI static bool ProfileIsCS;
 

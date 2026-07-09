@@ -16,14 +16,15 @@ PGOOptions::PGOOptions(std::string ProfileFile, std::string CSProfileGenFile,
                        std::string MemoryProfile, PGOAction Action,
                        CSPGOAction CSAction, ColdFuncOpt ColdType,
                        bool DebugInfoForProfiling, bool PseudoProbeForProfiling,
-                       bool AtomicCounterUpdate)
+                       bool AtomicCounterUpdate, bool PseudoProbeUseStableGUID)
     : ProfileFile(ProfileFile), CSProfileGenFile(CSProfileGenFile),
       ProfileRemappingFile(ProfileRemappingFile), MemoryProfile(MemoryProfile),
       Action(Action), CSAction(CSAction), ColdOptType(ColdType),
       DebugInfoForProfiling(DebugInfoForProfiling ||
                             (Action == SampleUse && !PseudoProbeForProfiling)),
       PseudoProbeForProfiling(PseudoProbeForProfiling),
-      AtomicCounterUpdate(AtomicCounterUpdate) {
+      AtomicCounterUpdate(AtomicCounterUpdate),
+      PseudoProbeUseStableGUID(PseudoProbeUseStableGUID) {
   // Note, we do allow ProfileFile.empty() for Action=IRUse LTO can
   // callback with IRUse action without ProfileFile.
 

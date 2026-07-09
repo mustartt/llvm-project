@@ -596,4 +596,39 @@ TEST_F(SampleProfTest, SampleProfileFuncOffsetTableOnDisk) {
   EXPECT_EQ(Table.lookup(0x1111111122222222ULL), std::nullopt);
 }
 
+// The SecFlagStableGUID summary flag round-trips through the ExtBinary format
+// via FunctionSamples::ProfileUsesStableGUID: the writer emits it when the
+// global is set, and the reader sets the global back when the flag is present.
+TEST_F(SampleProfTest, stable_guid_flag_roundtrip) {
+  LLVMContext Ctx;
+  Module M("stable_guid", Ctx);
+
+  const bool SavedFlag = FunctionSamples::ProfileUsesStableGUID;
+
+  TempFile ProfileFile("profile", "", "", /*Unique*/ true);
+  createWriter(SampleProfileFormat::SPF_Ext_Binary, ProfileFile.path());
+  FunctionSamples::ProfileUsesStableGUID = true;
+
+  SampleProfileMap Profiles;
+  FunctionId Foo(StringRef("foo"));
+  FunctionSamples &FooSamples = Profiles[Foo];
+  FooSamples.setFunction(Foo);
+  FooSamples.addTotalSamples(100);
+  FooSamples.addHeadSamples(10);
+  FooSamples.addBodySamples(1, 0, 100);
+
+  std::error_code EC = Writer->write(Profiles);
+  ASSERT_TRUE(NoError(EC));
+  Writer->getOutputStream().flush();
+
+  // Clear before reading to prove the reader restores it from the flag.
+  FunctionSamples::ProfileUsesStableGUID = false;
+  readProfile(M, ProfileFile.path());
+  EC = Reader->read();
+  ASSERT_TRUE(NoError(EC));
+  EXPECT_TRUE(FunctionSamples::ProfileUsesStableGUID);
+
+  FunctionSamples::ProfileUsesStableGUID = SavedFlag;
+}
+
 } // end anonymous namespace

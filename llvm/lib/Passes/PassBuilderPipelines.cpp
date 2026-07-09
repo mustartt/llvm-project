@@ -1129,8 +1129,15 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
 
   // Place pseudo probe instrumentation as the first pass of the pipeline to
   // minimize the impact of optimization changes.
-  if (PGOOpt && PGOOpt->PseudoProbeForProfiling && !isThinLTOPostLink(Phase))
+  if (PGOOpt && PGOOpt->PseudoProbeForProfiling && !isThinLTOPostLink(Phase)) {
+    // With stable GUIDs, assign the GUID metadata before probe emission so the
+    // probe descriptor, inline tree and DWARF all read one authoritative GUID
+    // instead of recomputing it from the (ambiguous) symbol name. Gated on the
+    // opt-in flag so existing pseudo-probe builds are unaffected.
+    if (PGOOpt->PseudoProbeUseStableGUID)
+      MPM.addPass(AssignGUIDPass());
     MPM.addPass(SampleProfileProbePass(TM));
+  }
 
   bool HasSampleProfile = PGOOpt && (PGOOpt->Action == PGOOptions::SampleUse);
 
@@ -2414,8 +2421,13 @@ PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
   // consistency between different build modes. For example, a LTO build can be
   // mixed with an O0 prelink and an O2 postlink. Loading a sample profile in
   // the postlink will require pseudo probe instrumentation in the prelink.
-  if (PGOOpt && PGOOpt->PseudoProbeForProfiling)
+  if (PGOOpt && PGOOpt->PseudoProbeForProfiling) {
+    // See buildModuleSimplificationPipeline: assign stable GUIDs before probe
+    // emission when opted in.
+    if (PGOOpt->PseudoProbeUseStableGUID)
+      MPM.addPass(AssignGUIDPass());
     MPM.addPass(SampleProfileProbePass(TM));
+  }
 
   if (PGOOpt && (PGOOpt->Action == PGOOptions::IRInstr ||
                  PGOOpt->Action == PGOOptions::IRUse))

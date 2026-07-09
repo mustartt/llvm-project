@@ -435,6 +435,8 @@ std::error_code SampleProfileWriterExtBinaryBase::writeOneSection(
     addSectionFlag(SecFuncMetadata, SecFuncMetadataFlags::SecFlagHasAttribute);
   if (Type == SecProfSummary && FunctionSamples::ProfileIsCS)
     addSectionFlag(SecProfSummary, SecProfSummaryFlags::SecFlagFullContext);
+  if (Type == SecProfSummary && FunctionSamples::ProfileUsesStableGUID)
+    addSectionFlag(SecProfSummary, SecProfSummaryFlags::SecFlagStableGUID);
   if (Type == SecProfSummary && FunctionSamples::ProfileIsPreInlined)
     addSectionFlag(SecProfSummary, SecProfSummaryFlags::SecFlagIsPreInlined);
   if (Type == SecProfSummary && FunctionSamples::ProfileIsFS)

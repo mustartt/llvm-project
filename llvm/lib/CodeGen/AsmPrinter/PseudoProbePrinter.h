@@ -23,12 +23,26 @@ namespace llvm {
 
 class AsmPrinter;
 class DILocation;
+class DISubprogram;
+class MachineFunction;
 
 class PseudoProbeHandler {
   // Target of pseudo probe emission.
   AsmPrinter *Asm;
-  // Name to GUID map, used as caching/memoization for speed.
+  // Name to GUID map, used as caching/memoization for speed. Only used by the
+  // name-hash fallback below.
   DenseMap<StringRef, uint64_t> NameGuidMap;
+
+  // Map from a function's DISubprogram to the GUID carried by its own block
+  // probes, built from the current MachineFunction. The inline-tree caller
+  // GUIDs are read from here rather than recomputed as MD5(name): with stable
+  // GUIDs the name hash is wrong, and under ThinLTO the caller Function is
+  // often gone -- but the callee's own (inlined/imported) block probe still
+  // carries the authoritative GUID and its DISubprogram survives. Rebuilt per
+  // MachineFunction.
+  DenseMap<const DISubprogram *, uint64_t> ProbeGuidMap;
+  const MachineFunction *ProbeGuidMapMF = nullptr;
+  void buildProbeGuidMap();
 
 #ifndef NDEBUG
   // All GUID in llvm.pseudo_probe_desc.

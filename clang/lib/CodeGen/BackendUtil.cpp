@@ -865,7 +865,8 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
         CodeGenOpts.SampleProfileFile, "", CodeGenOpts.ProfileRemappingFile,
         CodeGenOpts.MemoryProfileUsePath, PGOOptions::SampleUse,
         PGOOptions::NoCSAction, ClPGOColdFuncAttr,
-        CodeGenOpts.DebugInfoForProfiling, CodeGenOpts.PseudoProbeForProfiling);
+        CodeGenOpts.DebugInfoForProfiling, CodeGenOpts.PseudoProbeForProfiling,
+        /*AtomicCounterUpdate=*/false, CodeGenOpts.PseudoProbeUseStableGUID);
   else if (!CodeGenOpts.MemoryProfileUsePath.empty())
     // -fmemory-profile-use (without any of the above options)
     PGOOpt = PGOOptions("", "", "", CodeGenOpts.MemoryProfileUsePath,
@@ -875,7 +876,9 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     // -fpseudo-probe-for-profiling
     PGOOpt = PGOOptions("", "", "", /*MemoryProfile=*/"", PGOOptions::NoAction,
                         PGOOptions::NoCSAction, ClPGOColdFuncAttr,
-                        CodeGenOpts.DebugInfoForProfiling, true);
+                        CodeGenOpts.DebugInfoForProfiling, true,
+                        /*AtomicCounterUpdate=*/false,
+                        CodeGenOpts.PseudoProbeUseStableGUID);
   else if (CodeGenOpts.DebugInfoForProfiling)
     // -fdebug-info-for-profiling
     PGOOpt = PGOOptions("", "", "", /*MemoryProfile=*/"", PGOOptions::NoAction,

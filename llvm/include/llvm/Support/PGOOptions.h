@@ -30,7 +30,8 @@ struct PGOOptions {
                       ColdFuncOpt ColdType = ColdFuncOpt::Default,
                       bool DebugInfoForProfiling = false,
                       bool PseudoProbeForProfiling = false,
-                      bool AtomicCounterUpdate = false);
+                      bool AtomicCounterUpdate = false,
+                      bool PseudoProbeUseStableGUID = false);
   LLVM_ABI PGOOptions(const PGOOptions &);
   LLVM_ABI ~PGOOptions();
   LLVM_ABI PGOOptions &operator=(const PGOOptions &);
@@ -45,6 +46,11 @@ struct PGOOptions {
   bool DebugInfoForProfiling;
   bool PseudoProbeForProfiling;
   bool AtomicCounterUpdate;
+  /// When emitting pseudo probes, identify functions by their stable GUID
+  /// (assigned via AssignGUIDPass) rather than relying on
+  /// -funique-internal-linkage-names. Only meaningful when
+  /// PseudoProbeForProfiling is set.
+  bool PseudoProbeUseStableGUID;
 };
 } // namespace llvm
 

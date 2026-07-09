@@ -855,6 +855,8 @@ std::error_code SampleProfileReaderExtBinaryBase::readOneSection(
       Summary->setPartialProfile(true);
     if (hasSecFlag(Entry, SecProfSummaryFlags::SecFlagFullContext))
       FunctionSamples::ProfileIsCS = ProfileIsCS = true;
+    if (hasSecFlag(Entry, SecProfSummaryFlags::SecFlagStableGUID))
+      FunctionSamples::ProfileUsesStableGUID = true;
     if (hasSecFlag(Entry, SecProfSummaryFlags::SecFlagIsPreInlined))
       FunctionSamples::ProfileIsPreInlined = ProfileIsPreInlined = true;
     if (hasSecFlag(Entry, SecProfSummaryFlags::SecFlagFSDiscriminator))
@@ -976,8 +978,15 @@ bool SampleProfileReaderExtBinaryBase::collectFuncsFromModule() {
   if (!M)
     return false;
   FuncsToUse.clear();
-  for (auto &F : *M)
+  FuncGuidsToUse.clear();
+  for (auto &F : *M) {
     FuncsToUse.insert(FunctionSamples::getCanonicalFnName(F));
+    // With stable GUIDs the profile is keyed by getGUID(), which for
+    // internal-linkage functions is not MD5(name); collect the GUIDs so the
+    // GUID-keyed FuncOffsetTable can be looked up directly.
+    if (FunctionSamples::ProfileUsesStableGUID)
+      FuncGuidsToUse.insert(F.getGUIDOrFallback());
+  }
   return true;
 }
 
@@ -1072,12 +1081,25 @@ std::error_code SampleProfileReaderExtBinaryBase::readFuncProfiles(
     }
   } else if (useMD5()) {
     assert(!useFuncOffsetList());
-    for (auto Name : FuncsToUse) {
-      auto GUID = MD5Hash(Name);
-      if (auto Offset = FuncOffsetTable->lookup(GUID)) {
-        const uint8_t *FuncProfileAddr = Start + *Offset;
-        if (std::error_code EC = readFuncProfile(FuncProfileAddr, Profiles))
-          return EC;
+    // With stable GUIDs, look up the module's functions by their GUID directly
+    // (the offset table is GUID-keyed and names do not hash to the GUID for
+    // internal-linkage functions).
+    if (FunctionSamples::ProfileUsesStableGUID) {
+      for (auto GUID : FuncGuidsToUse) {
+        if (auto Offset = FuncOffsetTable->lookup(GUID)) {
+          const uint8_t *FuncProfileAddr = Start + *Offset;
+          if (std::error_code EC = readFuncProfile(FuncProfileAddr, Profiles))
+            return EC;
+        }
+      }
+    } else {
+      for (auto Name : FuncsToUse) {
+        auto GUID = MD5Hash(Name);
+        if (auto Offset = FuncOffsetTable->lookup(GUID)) {
+          const uint8_t *FuncProfileAddr = Start + *Offset;
+          if (std::error_code EC = readFuncProfile(FuncProfileAddr, Profiles))
+            return EC;
+        }
       }
     }
   } else if (Remapper) {
