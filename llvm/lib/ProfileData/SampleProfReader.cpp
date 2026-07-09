@@ -176,6 +176,23 @@ static bool ParseHead(const StringRef &Input, StringRef &FName,
 /// Returns true if line offset \p L is legal (only has 16 bits).
 static bool isOffsetLegal(unsigned L) { return (L & 0xffff) == L; }
 
+/// Convert a textual function identifier token to a FunctionId. A stable-GUID
+/// profile encodes each function as "name;guid", where the trailing decimal
+/// GUID (after the last ';') is the authoritative key and the name is a
+/// readable label. When such a token is seen, key by the GUID and mark the
+/// profile as stable-GUID keyed. Otherwise key by the name verbatim.
+static FunctionId parseFunctionId(StringRef FName) {
+  size_t Sep = FName.rfind(';');
+  if (Sep != StringRef::npos) {
+    uint64_t Guid;
+    if (!FName.substr(Sep + 1).getAsInteger(10, Guid) && Guid != 0) {
+      FunctionSamples::ProfileUsesStableGUID = true;
+      return FunctionId(Guid);
+    }
+  }
+  return FunctionId(FName);
+}
+
 /// Parse \p Input that contains metadata.
 /// Possible metadata:
 /// - CFG Checksum information:
@@ -401,7 +418,11 @@ std::error_code SampleProfileReaderText::readImpl() {
         return sampleprof_error::malformed;
       }
       DepthMetadata = 0;
-      SampleContext FContext(FName, CSNameTable);
+      // A stable-GUID (non-CS) profile encodes the function as "name;guid";
+      // key by the GUID. CS context strings ("[a @ b]") take the normal path.
+      SampleContext FContext = (!FName.starts_with("[") && FName.contains(';'))
+                                   ? SampleContext(parseFunctionId(FName))
+                                   : SampleContext(FName, CSNameTable);
       if (FContext.hasContext())
         ++CSProfileCount;
       FunctionSamples &FProfile = Profiles.create(FContext);
@@ -456,9 +477,10 @@ std::error_code SampleProfileReaderText::readImpl() {
       }
       switch (LineTy) {
       case LineType::CallSiteProfile: {
+        FunctionId Callee = parseFunctionId(FName);
         FunctionSamples &FSamples = InlineStack.back()->functionSamplesAt(
-            LineLocation(LineOffset, Discriminator))[FunctionId(FName)];
-        FSamples.setFunction(FunctionId(FName));
+            LineLocation(LineOffset, Discriminator))[Callee];
+        FSamples.setFunction(Callee);
         mergeSampleProfErrors(Result, FSamples.addTotalSamples(NumSamples));
         InlineStack.push_back(&FSamples);
         DepthMetadata = 0;
@@ -477,7 +499,7 @@ std::error_code SampleProfileReaderText::readImpl() {
         for (const auto &name_count : TargetCountMap) {
           mergeSampleProfErrors(Result, FProfile.addCalledTargetSamples(
                                             LineOffset, Discriminator,
-                                            FunctionId(name_count.first),
+                                            parseFunctionId(name_count.first),
                                             name_count.second));
         }
         mergeSampleProfErrors(

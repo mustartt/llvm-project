@@ -585,7 +585,14 @@ std::error_code SampleProfileWriterText::writeSample(const FunctionSamples &S) {
   auto &OS = *OutputStream;
   if (FunctionSamples::ProfileIsCS)
     OS << "[" << S.getContext().toString() << "]:" << S.getTotalSamples();
-  else
+  else if (FunctionSamples::ProfileUsesStableGUID) {
+    // Stable-GUID profiles are keyed by numeric GUID. Emit "name;guid" when a
+    // readable name is known (the GUID stays authoritative), else the bare GUID.
+    StringRef Name = S.getFuncName();
+    if (!Name.empty())
+      OS << Name << ";";
+    OS << S.getFunction() << ":" << S.getTotalSamples();
+  } else
     OS << S.getFunction() << ":" << S.getTotalSamples();
 
   if (Indent == 0)

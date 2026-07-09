@@ -170,6 +170,18 @@ void ProfileGeneratorBase::write(std::unique_ptr<SampleProfileWriter> Writer,
     Writer->setProfileSymbolList(&SymbolList);
   }
 
+  // For a stable-GUID textual profile, attach a GUID -> name map (from the
+  // pseudo-probe descriptors) so the writer can emit readable "name;guid"
+  // identifiers. The GUID remains the authoritative key; the name is a label.
+  if (FunctionSamples::ProfileUsesStableGUID && OutputFormat == SPF_Text &&
+      Binary->usePseudoProbes()) {
+    StableGUIDToFuncNameMap.clear();
+    for (const auto &Desc : Binary->getGUID2FuncDescMap())
+      StableGUIDToFuncNameMap[Desc.FuncGUID] = Desc.FuncName;
+    for (auto &I : ProfileMap)
+      I.second.setGUIDToFuncNameMap(StableGUIDToFuncNameMap);
+  }
+
   if (std::error_code EC = Writer->write(ProfileMap))
     exitWithError(std::move(EC));
 }

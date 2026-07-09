@@ -695,6 +695,11 @@ public:
     return ProbeDecoder.getFuncDescForGUID(GUID);
   }
 
+  // The decoded GUID -> function descriptor map (GUID, hash, name).
+  const GUIDProbeFunctionMap &getGUID2FuncDescMap() const {
+    return ProbeDecoder.getGUID2FuncDescMap();
+  }
+
   const MCPseudoProbeFuncDesc *
   getInlinerDescForProbe(const MCDecodedPseudoProbe *Probe) {
     return ProbeDecoder.getInlinerDescForProbe(Probe);

@@ -18,3 +18,19 @@
 ; PROF: Function: 15822663052811949562:2 @ 6699318081062747564:8 @ 16434608426314478903:
 ; PROF-NOT: Function: main
 ; PROF-NOT: Function: foo
+
+; Textual output uses the readable "name;guid" form (GUID authoritative, name a
+; label) at the top level, at inlined callsites, and for call targets. Reading
+; it back keys by the GUID and re-stamps SecFlagStableGUID.
+; RUN: llvm-profgen --format=text --ignore-stack-samples --stable-guid \
+; RUN:   --perfscript=%S/Inputs/inline-cs-pseudoprobe.perfscript \
+; RUN:   --binary=%S/Inputs/inline-cs-pseudoprobe.perfbin --output=%t.txt \
+; RUN:   --profile-summary-cold-count=0
+; RUN: FileCheck %s --check-prefix=TEXT --input-file %t.txt
+; RUN: llvm-profdata merge --sample --extbinary %t.txt -o %t.rt
+; RUN: llvm-profdata show --sample --show-sec-info-only %t.rt | FileCheck %s --check-prefix=SEC
+
+; TEXT: main;15822663052811949562:{{[0-9]+}}:{{[0-9]+}}
+; TEXT: {{[0-9]+}}: foo;6699318081062747564:{{[0-9]+}}
+; TEXT: {{[0-9]+}}: bar;16434608426314478903:{{[0-9]+}}
+

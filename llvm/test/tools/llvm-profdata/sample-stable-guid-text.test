@@ -1,0 +1,15 @@
+; Check that a textual sample profile using the stable-GUID "name;guid" function
+; identifier form is read by keying on the GUID (not by hashing the name), and
+; that merging to extbinary stamps SecFlagStableGUID. The trailing decimal after
+; ';' is authoritative; the name is a readable label.
+
+; RUN: llvm-profdata merge --sample --extbinary %S/Inputs/sample-stable-guid.proftext -o %t.extbin
+; RUN: llvm-profdata show --sample --show-sec-info-only %t.extbin | FileCheck %s --check-prefix=SEC
+; RUN: llvm-profdata show --sample %t.extbin | FileCheck %s --check-prefix=SHOW
+
+; SEC: ProfileSummarySection {{.*}}Flags: {{{.*}}stable-guid{{.*}}}
+
+; The key is the explicit GUID after ';' (12134428303565701041); the name
+; "helper" is a decorative label and is NOT hashed into the key.
+; SHOW: Function: 12134428303565701041:
+; SHOW-NOT: Function: helper

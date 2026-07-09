@@ -151,6 +151,12 @@ protected:
   // Used by SampleProfileWriter
   SampleProfileMap ProfileMap;
 
+  // In stable-GUID mode, maps each stable GUID to a readable function name
+  // (built from pseudo-probe descriptors) so the text writer can emit
+  // "name;guid". Owns the backing storage referenced by FunctionSamples'
+  // GUIDToFuncNameMap pointers, hence must outlive the write.
+  DenseMap<uint64_t, StringRef> StableGUIDToFuncNameMap;
+
   const ContextSampleCounterMap *SampleCounters = nullptr;
 };
 

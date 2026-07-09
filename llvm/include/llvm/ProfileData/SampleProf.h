@@ -1296,10 +1296,14 @@ public:
   /// If the original name doesn't exist in the map, return empty StringRef.
   StringRef getFuncName(FunctionId Func) const {
     // A stable-GUID profile keys functions by their numeric GUID even in
-    // non-MD5 (textual) form, so there is no embedded string to return. Callers
-    // that need a printable label should consult the descriptor separately.
-    if (!Func.isStringRef())
+    // non-MD5 (textual) form. If a GUID -> name map is available (e.g. built
+    // from pseudo-probe descriptors by llvm-profgen) return the readable name;
+    // otherwise there is no embedded string to return.
+    if (!Func.isStringRef()) {
+      if (GUIDToFuncNameMap)
+        return GUIDToFuncNameMap->lookup(Func.getHashCode());
       return StringRef();
+    }
 
     if (!UseMD5)
       return Func.stringRef();
@@ -1377,6 +1381,16 @@ public:
   /// GUIDToFuncNameMap saves the mapping from GUID to the symbol name, for
   /// all the function symbols defined or declared in current module.
   DenseMap<uint64_t, StringRef> *GUIDToFuncNameMap = nullptr;
+
+  /// Recursively set the GUID -> name map on this profile and all of its
+  /// inlined callee profiles, so name lookups (e.g. for readable "name;guid"
+  /// text output) work throughout the inline tree. \p Map must outlive this.
+  void setGUIDToFuncNameMap(DenseMap<uint64_t, StringRef> &Map) {
+    GUIDToFuncNameMap = &Map;
+    for (auto &CS : CallsiteSamples)
+      for (auto &NameFS : CS.second)
+        NameFS.second.setGUIDToFuncNameMap(Map);
+  }
 
   /// Return the GUID of the context's name. If the context is already using
   /// MD5, don't hash it again.
