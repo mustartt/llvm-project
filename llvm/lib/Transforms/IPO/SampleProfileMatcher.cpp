@@ -70,28 +70,48 @@ static cl::opt<unsigned> SalvageStaleProfileMaxCallsites(
 
 void SampleProfileMatcher::findIRAnchors(const Function &F,
                                          AnchorMap &IRAnchors) const {
+  const Module *M = F.getParent();
+
+  // Return the callee anchor identity. When the profile is keyed by stable
+  // GUIDs, use the callee's GUID (which for internal-linkage functions is not
+  // MD5(name)) so that it matches the GUID-keyed profile anchors; otherwise use
+  // the (canonical) name. For an inlined callsite we only have the callee name,
+  // so recover a same-named definition in the module to obtain its GUID.
+  auto CalleeAnchor = [M](const Function *Callee,
+                          StringRef Name) -> FunctionId {
+    if (FunctionSamples::ProfileUsesStableGUID) {
+      if (!Callee && !Name.empty() && Name != UnknownIndirectCallee)
+        Callee = M->getFunction(Name);
+      if (Callee)
+        return FunctionId(Callee->getGUIDOrFallback());
+    }
+    return FunctionId(Name);
+  };
+
   // For inlined code, recover the original callsite and callee by finding the
   // top-level inline frame. e.g. For frame stack "main:1 @ foo:2 @ bar:3", the
   // top-level frame is "main:1", the callsite is "1" and the callee is "foo".
-  auto FindTopLevelInlinedCallsite = [](const DILocation *DIL) {
-    assert((DIL && DIL->getInlinedAt()) && "No inlined callsite");
-    const DILocation *PrevDIL = nullptr;
-    do {
-      PrevDIL = DIL;
-      DIL = DIL->getInlinedAt();
-    } while (DIL->getInlinedAt());
+  auto FindTopLevelInlinedCallsite =
+      [&CalleeAnchor](const DILocation *DIL) {
+        assert((DIL && DIL->getInlinedAt()) && "No inlined callsite");
+        const DILocation *PrevDIL = nullptr;
+        do {
+          PrevDIL = DIL;
+          DIL = DIL->getInlinedAt();
+        } while (DIL->getInlinedAt());
 
-    LineLocation Callsite = FunctionSamples::getCallSiteIdentifier(
-        DIL, FunctionSamples::ProfileIsFS);
-    StringRef CalleeName = PrevDIL->getSubprogramLinkageName();
-    return std::make_pair(Callsite, FunctionId(CalleeName));
-  };
+        LineLocation Callsite = FunctionSamples::getCallSiteIdentifier(
+            DIL, FunctionSamples::ProfileIsFS);
+        StringRef CalleeName = PrevDIL->getSubprogramLinkageName();
+        return std::make_pair(Callsite, CalleeAnchor(nullptr, CalleeName));
+      };
 
-  auto GetCanonicalCalleeName = [](const CallBase *CB) {
-    StringRef CalleeName = UnknownIndirectCallee;
+  auto GetCanonicalCalleeAnchor =
+      [&CalleeAnchor](const CallBase *CB) -> FunctionId {
     if (Function *Callee = CB->getCalledFunction())
-      CalleeName = FunctionSamples::getCanonicalFnName(Callee->getName());
-    return CalleeName;
+      return CalleeAnchor(
+          Callee, FunctionSamples::getCanonicalFnName(Callee->getName()));
+    return FunctionId(UnknownIndirectCallee);
   };
 
   // Extract profile matching anchors in the IR.
@@ -107,15 +127,15 @@ void SampleProfileMatcher::findIRAnchors(const Function &F,
           if (DIL->getInlinedAt()) {
             IRAnchors.emplace(FindTopLevelInlinedCallsite(DIL));
           } else {
-            // Use empty StringRef for basic block probe.
-            StringRef CalleeName;
+            // Use empty FunctionId for basic block probe.
+            FunctionId Callee;
             if (const auto *CB = dyn_cast<CallBase>(&I)) {
               // Skip the probe inst whose callee name is "llvm.pseudoprobe".
               if (!isa<IntrinsicInst>(&I))
-                CalleeName = GetCanonicalCalleeName(CB);
+                Callee = GetCanonicalCalleeAnchor(CB);
             }
             LineLocation Loc = LineLocation(Probe->Id, 0);
-            IRAnchors.emplace(Loc, FunctionId(CalleeName));
+            IRAnchors.emplace(Loc, Callee);
           }
         }
       } else {
@@ -130,8 +150,8 @@ void SampleProfileMatcher::findIRAnchors(const Function &F,
         } else {
           LineLocation Callsite = FunctionSamples::getCallSiteIdentifier(
               DIL, FunctionSamples::ProfileIsFS);
-          StringRef CalleeName = GetCanonicalCalleeName(dyn_cast<CallBase>(&I));
-          IRAnchors.emplace(Callsite, FunctionId(CalleeName));
+          IRAnchors.emplace(Callsite,
+                            GetCanonicalCalleeAnchor(dyn_cast<CallBase>(&I)));
         }
       }
     }
@@ -252,7 +272,7 @@ void SampleProfileMatcher::matchNonCallsiteLocs(
     if (R != MatchedAnchors.end()) {
       const auto &Candidate = R->second;
       UpdateMatching(Loc, Candidate);
-      LLVM_DEBUG(dbgs() << "Callsite with callee:" << IR.second.stringRef()
+      LLVM_DEBUG(dbgs() << "Callsite with callee:" << IR.second
                         << " is matched from " << Loc << " to " << Candidate
                         << "\n");
       LocationDelta = Candidate.LineOffset - Loc.LineOffset;
@@ -293,7 +313,7 @@ void SampleProfileMatcher::getFilteredAnchorList(
     const AnchorMap &IRAnchors, const AnchorMap &ProfileAnchors,
     AnchorList &FilteredIRAnchorsList, AnchorList &FilteredProfileAnchorList) {
   for (const auto &I : IRAnchors) {
-    if (I.second.stringRef().empty())
+    if (I.second.empty())
       continue;
     FilteredIRAnchorsList.emplace_back(I);
   }
@@ -369,7 +389,12 @@ void SampleProfileMatcher::runStaleProfileMatching(
   for (const auto &IR : IRAnchors) {
     bool ProfileConflicted = false;
     const auto &Loc = IR.first;
-    Function *Callee = M.getFunction(IR.second.stringRef());
+    // The IR anchor identity is a GUID when the profile uses stable GUIDs, in
+    // which case it cannot be turned back into a name; resolve the callee via
+    // the (GUID-keyed) SymbolMap. Otherwise look it up by name.
+    Function *Callee = IR.second.isStringRef()
+                           ? M.getFunction(IR.second.stringRef())
+                           : SymbolMap->lookup(IR.second);
     if (!Callee)
       continue;
     FunctionId ProfAnchor;
@@ -540,7 +565,7 @@ void SampleProfileMatcher::recordCallsiteMatchStates(
   // IR callsites.
   for (const auto &I : ProfileAnchors) {
     const auto &Loc = I.first;
-    assert(!I.second.stringRef().empty() && "Callees should not be empty");
+    assert(!I.second.empty() && "Callees should not be empty");
     auto It = CallsiteMatchStates.find(Loc);
     if (It == CallsiteMatchStates.end())
       CallsiteMatchStates.try_emplace(Loc, MatchState::InitialMismatch);

@@ -2184,6 +2184,11 @@ bool SampleProfileLoader::runOnModule(Module &M, ModuleAnalysisManager &AM,
     if (F == nullptr || OrigName.empty())
       continue;
     SymbolMap[FunctionId(OrigName)] = F;
+    // When the profile is keyed by stable GUIDs, callee identities in the
+    // profile are GUIDs; map the function's GUID to it so callee lookups
+    // resolve for internal-linkage functions.
+    if (FunctionSamples::ProfileUsesStableGUID)
+      SymbolMap[FunctionId(F->getGUIDOrFallback())] = F;
     StringRef NewName = FunctionSamples::getCanonicalFnName(*F);
     if (OrigName != NewName && !NewName.empty()) {
       auto r = SymbolMap.emplace(FunctionId(NewName), F);
