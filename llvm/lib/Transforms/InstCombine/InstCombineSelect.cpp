@@ -1685,6 +1685,68 @@ bool InstCombinerImpl::replaceInInstruction(Value *V, Value *Old, Value *New,
   return Changed;
 }
 
+/// Replace operands of a select arm that are selects on the same condition
+/// with the value they pick on that side:
+///   %s = select i1 %c, i32 %a, i32 %b
+///   %i = add i32 %s, 1
+///   %r = select i1 %c, i32 %i, i32 %x
+/// -->
+///   %i = add i32 %a, 1
+/// Unlike replaceInInstruction, the arm and the inner select may have other
+/// uses, as long as every use of the arm is an arm of a select on the same
+/// condition. Uses on the opposite side are given a copy of the arm, which is
+/// only done when all other operands of the arm are constants.
+Instruction *InstCombinerImpl::foldSelectArmOperandsOnSameCond(SelectInst &SI,
+                                                               bool TrueArm) {
+  Value *Cond = SI.getCondition();
+  unsigned ArmIdx = TrueArm ? 1 : 2;
+  auto *I = dyn_cast<Instruction>(SI.getOperand(ArmIdx));
+  if (!I || isa<PHINode>(I) ||
+      !isSafeToSpeculativelyExecuteWithVariableReplaced(I))
+    return nullptr;
+
+  if (Cond->getType()->isVectorTy() && !isNotCrossLaneOperation(I))
+    return nullptr;
+
+  auto GetPickedValue = [&](Value *V) -> Value * {
+    auto *Inner = dyn_cast<SelectInst>(V);
+    if (!Inner || Inner->getCondition() != Cond)
+      return nullptr;
+    return TrueArm ? Inner->getTrueValue() : Inner->getFalseValue();
+  };
+  if (none_of(I->operands(), [&](Value *V) { return GetPickedValue(V); }))
+    return nullptr;
+
+  bool HasOppositeUse = false;
+  for (Use &U : I->uses()) {
+    auto *User = dyn_cast<SelectInst>(U.getUser());
+    if (!User || User->getCondition() != Cond || U.getOperandNo() == 0)
+      return nullptr;
+    HasOppositeUse |= U.getOperandNo() != ArmIdx;
+  }
+
+  Instruction *Arm = I;
+  if (HasOppositeUse) {
+    if (!all_of(I->operands(), [&](Value *V) {
+          return isa<Constant>(V) || GetPickedValue(V);
+        }))
+      return nullptr;
+    Arm = I->clone();
+    Arm->setName(I->getName());
+    InsertNewInstWith(Arm, I->getIterator());
+    I->replaceUsesWithIf(Arm,
+                         [&](Use &U) { return U.getOperandNo() == ArmIdx; });
+    Worklist.pushUsersToWorkList(*Arm);
+    Worklist.pushUsersToWorkList(*I);
+  }
+
+  for (Use &Op : Arm->operands())
+    if (Value *V = GetPickedValue(Op))
+      replaceUse(Op, V);
+  Worklist.add(Arm);
+  return &SI;
+}
+
 /// If we have a select with an equality comparison, then we know the value in
 /// one of the arms of the select. See if substituting this value into an arm
 /// and simplifying the result yields the same value as the other arm.
@@ -4646,6 +4708,13 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {
         replaceInInstruction(FalseVal, CondVal,
                              ConstantInt::getFalse(CondType)))
       return &SI;
+  }
+
+  if (!isa<Constant>(CondVal)) {
+    if (Instruction *R = foldSelectArmOperandsOnSameCond(SI, /*TrueArm=*/true))
+      return R;
+    if (Instruction *R = foldSelectArmOperandsOnSameCond(SI, /*TrueArm=*/false))
+      return R;
   }
 
   if (Instruction *R = foldSelectOfBools(SI))

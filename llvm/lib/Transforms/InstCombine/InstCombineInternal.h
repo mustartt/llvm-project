@@ -831,6 +831,7 @@ public:
 
   bool replaceInInstruction(Value *V, Value *Old, Value *New,
                             unsigned Depth = 0);
+  Instruction *foldSelectArmOperandsOnSameCond(SelectInst &SI, bool TrueArm);
 
   Value *insertRangeTest(Value *V, const APInt &Lo, const APInt &Hi,
                          bool isSigned, bool Inside);
