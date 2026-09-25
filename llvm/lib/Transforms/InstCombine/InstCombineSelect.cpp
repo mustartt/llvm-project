@@ -1694,8 +1694,7 @@ bool InstCombinerImpl::replaceInInstruction(Value *V, Value *Old, Value *New,
 ///   %i = add i32 %a, 1
 /// Unlike replaceInInstruction, the arm and the inner select may have other
 /// uses, as long as every use of the arm is an arm of a select on the same
-/// condition. Uses on the opposite side are given a copy of the arm, which is
-/// only done when all other operands of the arm are constants.
+/// condition and on the same side.
 Instruction *InstCombinerImpl::foldSelectArmOperandsOnSameCond(SelectInst &SI,
                                                                bool TrueArm) {
   Value *Cond = SI.getCondition();
@@ -1717,33 +1716,16 @@ Instruction *InstCombinerImpl::foldSelectArmOperandsOnSameCond(SelectInst &SI,
   if (none_of(I->operands(), [&](Value *V) { return GetPickedValue(V); }))
     return nullptr;
 
-  bool HasOppositeUse = false;
   for (Use &U : I->uses()) {
     auto *User = dyn_cast<SelectInst>(U.getUser());
-    if (!User || User->getCondition() != Cond || U.getOperandNo() == 0)
+    if (!User || User->getCondition() != Cond || U.getOperandNo() != ArmIdx)
       return nullptr;
-    HasOppositeUse |= U.getOperandNo() != ArmIdx;
   }
 
-  Instruction *Arm = I;
-  if (HasOppositeUse) {
-    if (!all_of(I->operands(), [&](Value *V) {
-          return isa<Constant>(V) || GetPickedValue(V);
-        }))
-      return nullptr;
-    Arm = I->clone();
-    Arm->setName(I->getName());
-    InsertNewInstWith(Arm, I->getIterator());
-    I->replaceUsesWithIf(Arm,
-                         [&](Use &U) { return U.getOperandNo() == ArmIdx; });
-    Worklist.pushUsersToWorkList(*Arm);
-    Worklist.pushUsersToWorkList(*I);
-  }
-
-  for (Use &Op : Arm->operands())
+  for (Use &Op : I->operands())
     if (Value *V = GetPickedValue(Op))
       replaceUse(Op, V);
-  Worklist.add(Arm);
+  Worklist.add(I);
   return &SI;
 }
 

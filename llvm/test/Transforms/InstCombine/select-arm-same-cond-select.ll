@@ -26,11 +26,10 @@ define { i32, i32 } @arm_multiuse_same_side(i1 %c, i32 %a, i32 %b, i32 %x, i32 %
 
 define { i32, i32 } @counter_pair(i1 %c, i32 %a, i32 %b) {
 ; CHECK-LABEL: @counter_pair(
-; CHECK-NEXT:    [[NOT_C:%.*]] = xor i1 [[C:%.*]], true
-; CHECK-NEXT:    [[INC1:%.*]] = zext i1 [[NOT_C]] to i32
-; CHECK-NEXT:    [[AN:%.*]] = add i32 [[A:%.*]], [[INC1]]
-; CHECK-NEXT:    [[INC:%.*]] = zext i1 [[C]] to i32
-; CHECK-NEXT:    [[BN:%.*]] = add i32 [[B:%.*]], [[INC]]
+; CHECK-NEXT:    [[S:%.*]] = select i1 [[C:%.*]], i32 [[B:%.*]], i32 [[A:%.*]]
+; CHECK-NEXT:    [[INC:%.*]] = add i32 [[S]], 1
+; CHECK-NEXT:    [[AN:%.*]] = select i1 [[C]], i32 [[A]], i32 [[INC]]
+; CHECK-NEXT:    [[BN:%.*]] = select i1 [[C]], i32 [[INC]], i32 [[B]]
 ; CHECK-NEXT:    [[I0:%.*]] = insertvalue { i32, i32 } poison, i32 [[AN]], 0
 ; CHECK-NEXT:    [[I1:%.*]] = insertvalue { i32, i32 } [[I0]], i32 [[BN]], 1
 ; CHECK-NEXT:    ret { i32, i32 } [[I1]]
@@ -47,11 +46,9 @@ define { i32, i32 } @counter_pair(i1 %c, i32 %a, i32 %b) {
 define { i32, i32, i32 } @counter_pair_live_inner(i1 %c, i32 %a, i32 %b) {
 ; CHECK-LABEL: @counter_pair_live_inner(
 ; CHECK-NEXT:    [[S:%.*]] = select i1 [[C:%.*]], i32 [[B:%.*]], i32 [[A:%.*]]
-; CHECK-NEXT:    [[NOT_C:%.*]] = xor i1 [[C]], true
-; CHECK-NEXT:    [[INC1:%.*]] = zext i1 [[NOT_C]] to i32
-; CHECK-NEXT:    [[AN:%.*]] = add nuw i32 [[A]], [[INC1]]
-; CHECK-NEXT:    [[INC:%.*]] = zext i1 [[C]] to i32
-; CHECK-NEXT:    [[BN:%.*]] = add nuw i32 [[B]], [[INC]]
+; CHECK-NEXT:    [[INC:%.*]] = add nuw i32 [[S]], 1
+; CHECK-NEXT:    [[AN:%.*]] = select i1 [[C]], i32 [[A]], i32 [[INC]]
+; CHECK-NEXT:    [[BN:%.*]] = select i1 [[C]], i32 [[INC]], i32 [[B]]
 ; CHECK-NEXT:    [[I0:%.*]] = insertvalue { i32, i32, i32 } poison, i32 [[AN]], 0
 ; CHECK-NEXT:    [[I1:%.*]] = insertvalue { i32, i32, i32 } [[I0]], i32 [[BN]], 1
 ; CHECK-NEXT:    [[I2:%.*]] = insertvalue { i32, i32, i32 } [[I1]], i32 [[S]], 2
@@ -69,11 +66,10 @@ define { i32, i32, i32 } @counter_pair_live_inner(i1 %c, i32 %a, i32 %b) {
 
 define { i32, i32 } @not_pair(i1 %c, i32 %a, i32 %b) {
 ; CHECK-LABEL: @not_pair(
-; CHECK-NEXT:    [[N1:%.*]] = sext i1 [[C:%.*]] to i32
-; CHECK-NEXT:    [[AN:%.*]] = xor i32 [[A:%.*]], [[N1]]
-; CHECK-NEXT:    [[NOT_C:%.*]] = xor i1 [[C]], true
-; CHECK-NEXT:    [[N:%.*]] = sext i1 [[NOT_C]] to i32
-; CHECK-NEXT:    [[BN:%.*]] = xor i32 [[B:%.*]], [[N]]
+; CHECK-NEXT:    [[S:%.*]] = select i1 [[C:%.*]], i32 [[A:%.*]], i32 [[B:%.*]]
+; CHECK-NEXT:    [[N:%.*]] = xor i32 [[S]], -1
+; CHECK-NEXT:    [[AN:%.*]] = select i1 [[C]], i32 [[N]], i32 [[A]]
+; CHECK-NEXT:    [[BN:%.*]] = select i1 [[C]], i32 [[B]], i32 [[N]]
 ; CHECK-NEXT:    [[I0:%.*]] = insertvalue { i32, i32 } poison, i32 [[AN]], 0
 ; CHECK-NEXT:    [[I1:%.*]] = insertvalue { i32, i32 } [[I0]], i32 [[BN]], 1
 ; CHECK-NEXT:    ret { i32, i32 } [[I1]]
@@ -89,11 +85,10 @@ define { i32, i32 } @not_pair(i1 %c, i32 %a, i32 %b) {
 
 define { <4 x i32>, <4 x i32> } @counter_pair_vec(<4 x i1> %c, <4 x i32> %a, <4 x i32> %b) {
 ; CHECK-LABEL: @counter_pair_vec(
-; CHECK-NEXT:    [[NOT_C:%.*]] = xor <4 x i1> [[C:%.*]], splat (i1 true)
-; CHECK-NEXT:    [[INC1:%.*]] = zext <4 x i1> [[NOT_C]] to <4 x i32>
-; CHECK-NEXT:    [[AN:%.*]] = add <4 x i32> [[A:%.*]], [[INC1]]
-; CHECK-NEXT:    [[INC:%.*]] = zext <4 x i1> [[C]] to <4 x i32>
-; CHECK-NEXT:    [[BN:%.*]] = add <4 x i32> [[B:%.*]], [[INC]]
+; CHECK-NEXT:    [[S:%.*]] = select <4 x i1> [[C:%.*]], <4 x i32> [[B:%.*]], <4 x i32> [[A:%.*]]
+; CHECK-NEXT:    [[INC:%.*]] = add <4 x i32> [[S]], splat (i32 1)
+; CHECK-NEXT:    [[AN:%.*]] = select <4 x i1> [[C]], <4 x i32> [[A]], <4 x i32> [[INC]]
+; CHECK-NEXT:    [[BN:%.*]] = select <4 x i1> [[C]], <4 x i32> [[INC]], <4 x i32> [[B]]
 ; CHECK-NEXT:    [[I0:%.*]] = insertvalue { <4 x i32>, <4 x i32> } poison, <4 x i32> [[AN]], 0
 ; CHECK-NEXT:    [[I1:%.*]] = insertvalue { <4 x i32>, <4 x i32> } [[I0]], <4 x i32> [[BN]], 1
 ; CHECK-NEXT:    ret { <4 x i32>, <4 x i32> } [[I1]]
