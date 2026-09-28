@@ -56,6 +56,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstVisitor.h"
@@ -79,6 +80,7 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -116,11 +118,51 @@ STATISTIC(
     "Number of stores rewritten into predicated loads to allow promotion");
 STATISTIC(NumDeleted, "Number of instructions deleted");
 STATISTIC(NumVectorized, "Number of vectorized aggregates");
+STATISTIC(NumDynIdxAllocas,
+          "Number of allocas blocked by dynamically indexed accesses");
+STATISTIC(NumDynIdxLegal, "Number of dynamically indexed allocas that are "
+                          "legal to rewrite with selects");
+STATISTIC(NumDynIdxLoads, "Number of dynamically indexed loads in legal "
+                          "allocas");
+STATISTIC(NumDynIdxStores, "Number of dynamically indexed stores in legal "
+                           "allocas");
+STATISTIC(NumDynIdxCandidates, "Total number of candidate offsets of "
+                               "dynamically indexed accesses in legal allocas");
+STATISTIC(
+    MaxDynIdxCandidates,
+    "Maximum number of candidate offsets of a dynamically indexed access");
+STATISTIC(NumDynIdxRejectEscape, "Number of dynamically indexed allocas "
+                                 "rejected because the alloca escapes");
+STATISTIC(NumDynIdxRejectReadOnlyEscape,
+          "Number of dynamically indexed allocas rejected because the alloca "
+          "escapes into a read-only use");
+STATISTIC(NumDynIdxRejectUnsupportedUse,
+          "Number of dynamically indexed allocas rejected because a "
+          "dynamically indexed pointer has a use other than a simple load or "
+          "store");
+STATISTIC(NumDynIdxMayWrap,
+          "Number of dynamically indexed accesses through a GEP that may wrap");
+STATISTIC(NumDynIdxRejectScalable,
+          "Number of dynamically indexed allocas rejected because of a "
+          "scalable type");
+STATISTIC(NumDynIdxRejectTooManyCandidates,
+          "Number of dynamically indexed allocas rejected because an access "
+          "has too many candidate offsets");
 
 namespace llvm {
 /// Disable running mem2reg during SROA in order to test or debug SROA.
 static cl::opt<bool> SROASkipMem2Reg("sroa-skip-mem2reg", cl::init(false),
                                      cl::Hidden);
+
+static cl::opt<bool> SROADynamicIndex(
+    "sroa-dynamic-index", cl::init(false), cl::Hidden,
+    cl::desc("Analyze allocas with dynamically indexed accesses that could be "
+             "rewritten into selects over constant offsets"));
+
+static cl::opt<unsigned> SROADynamicIndexMaxCandidates(
+    "sroa-dynamic-index-max-candidates", cl::init(16), cl::Hidden,
+    cl::desc("Maximum number of candidate offsets for a dynamically indexed "
+             "access"));
 } // namespace llvm
 
 namespace {
@@ -253,6 +295,7 @@ private:
   rewritePartition(AllocaInst &AI, AllocaSlices &AS, Partition &P);
   bool splitAlloca(AllocaInst &AI, AllocaSlices &AS);
   bool propagateStoredValuesToLoads(AllocaInst &AI, AllocaSlices &AS);
+  bool promoteDynamicIndex(AllocaInst &AI);
   std::pair<bool /*Changed*/, bool /*CFGChanged*/> runOnAlloca(AllocaInst &AI);
   void clobberUse(Use &U);
   bool deleteDeadInstructions(SmallPtrSetImpl<AllocaInst *> &DeletedAllocas);
@@ -591,7 +634,11 @@ public:
 class AllocaSlices {
 public:
   /// Construct the slices of a particular alloca.
-  AllocaSlices(const DataLayout &DL, AllocaInst &AI);
+  ///
+  /// If \p RecordDynamicAccesses is set, users of pointers with unknown
+  /// offsets are collected in DynamicAccesses instead of aborting the walk.
+  AllocaSlices(const DataLayout &DL, AllocaInst &AI,
+               bool RecordDynamicAccesses = false);
 
   /// Test whether a pointer to the allocation escapes our analysis.
   ///
@@ -652,6 +699,10 @@ public:
   /// need to replace with undef.
   ArrayRef<Use *> getDeadOperands() const { return DeadOperands; }
 
+  ArrayRef<Instruction *> getDynamicAccesses() const {
+    return DynamicAccesses.getArrayRef();
+  }
+
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
   void print(raw_ostream &OS, const_iterator I, StringRef Indent = "  ") const;
   void printSlice(raw_ostream &OS, const_iterator I,
@@ -711,6 +762,11 @@ private:
   /// want to swap this particular input for poison to simplify the use lists of
   /// the alloca.
   SmallVector<Use *, 8> DeadOperands;
+
+  const bool RecordDynamicAccesses;
+
+  /// Users of pointers into the alloca whose offset is not a constant.
+  SmallSetVector<Instruction *, 4> DynamicAccesses;
 };
 
 /// A partition of the slices.
@@ -1038,6 +1094,18 @@ private:
       AS.DeadUsers.push_back(&I);
   }
 
+  bool recordDynamicAccess(Instruction &I) {
+    if (!AS.RecordDynamicAccesses)
+      return false;
+    AS.DynamicAccesses.insert(&I);
+    return true;
+  }
+
+  void abortUnknownOffset(Instruction &I) {
+    if (!recordDynamicAccess(I))
+      PI.setAborted(&I);
+  }
+
   void insertUse(Instruction &I, const APInt &Offset, uint64_t Size,
                  bool IsSplittable = false) {
     // Completely skip uses which have a zero size or start either before or
@@ -1112,8 +1180,11 @@ private:
 
     // If there is a load with an unknown offset, we can still perform store
     // to load forwarding for other known-offset loads.
-    if (!IsOffsetKnown)
-      return PI.setEscapedReadOnly(&LI);
+    if (!IsOffsetKnown) {
+      if (!recordDynamicAccess(LI))
+        PI.setEscapedReadOnly(&LI);
+      return;
+    }
 
     TypeSize Size = DL.getTypeStoreSize(LI.getType());
     if (Size.isScalable()) {
@@ -1133,7 +1204,7 @@ private:
     if (ValOp == *U)
       return PI.setEscapedAndAborted(&SI);
     if (!IsOffsetKnown)
-      return PI.setAborted(&SI);
+      return abortUnknownOffset(SI);
 
     TypeSize StoreSize = DL.getTypeStoreSize(ValOp->getType());
     if (StoreSize.isScalable()) {
@@ -1176,7 +1247,7 @@ private:
       return markAsDead(II);
 
     if (!IsOffsetKnown)
-      return PI.setAborted(&II);
+      return abortUnknownOffset(II);
 
     insertUse(II, Offset,
               Length ? Length->getLimitedValue()
@@ -1196,7 +1267,7 @@ private:
       return;
 
     if (!IsOffsetKnown)
-      return PI.setAborted(&II);
+      return abortUnknownOffset(II);
 
     // This side of the transfer is completely out-of-bounds, and so we can
     // nuke the entire transfer. However, we also need to nuke the other side
@@ -1263,7 +1334,7 @@ private:
     }
 
     if (!IsOffsetKnown)
-      return PI.setAborted(&II);
+      return abortUnknownOffset(II);
 
     if (II.isLifetimeStartOrEnd()) {
       insertUse(II, Offset, AllocSize, true);
@@ -1361,7 +1432,7 @@ private:
     }
 
     if (!IsOffsetKnown)
-      return PI.setAborted(&I);
+      return abortUnknownOffset(I);
 
     // See if we already have computed info on this node.
     uint64_t &Size = PHIOrSelectSizes[&I];
@@ -1406,12 +1477,14 @@ private:
   }
 };
 
-AllocaSlices::AllocaSlices(const DataLayout &DL, AllocaInst &AI)
+AllocaSlices::AllocaSlices(const DataLayout &DL, AllocaInst &AI,
+                           bool RecordDynamicAccesses)
     :
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
       AI(AI),
 #endif
-      PointerEscapingInstr(nullptr), PointerEscapingInstrReadOnly(nullptr) {
+      PointerEscapingInstr(nullptr), PointerEscapingInstrReadOnly(nullptr),
+      RecordDynamicAccesses(RecordDynamicAccesses) {
   SliceBuilder PB(DL, AI, *this);
   SliceBuilder::PtrInfo PtrI = PB.visitPtr(AI);
   if (PtrI.isEscaped() || PtrI.isAborted()) {
@@ -6161,6 +6234,199 @@ bool SROA::propagateStoredValuesToLoads(AllocaInst &AI, AllocaSlices &AS) {
   return true;
 }
 
+namespace {
+enum class DynamicIndexResult {
+  Legal,
+  UnsupportedUse,
+  Scalable,
+  TooManyCandidates
+};
+} // namespace
+
+/// Compute the offsets within \p AI that the dynamically indexed access \p I
+/// may touch without invoking UB.
+///
+/// The address is decomposed into C + sum(Idx_j * Stride_j), so every
+/// candidate offset is congruent to C modulo G = gcd(Stride_j). If any GEP
+/// may wrap, that congruence only holds modulo powers of two.
+static DynamicIndexResult
+computeDynamicIndexCandidates(const DataLayout &DL, AllocaInst &AI,
+                              uint64_t AllocSize, Instruction &I,
+                              SmallVectorImpl<uint64_t> &Candidates) {
+  if (auto *LI = dyn_cast<LoadInst>(&I)) {
+    if (!LI->isSimple())
+      return DynamicIndexResult::UnsupportedUse;
+  } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+    if (!SI->isSimple())
+      return DynamicIndexResult::UnsupportedUse;
+  } else {
+    return DynamicIndexResult::UnsupportedUse;
+  }
+
+  TypeSize AccessSize = DL.getTypeStoreSize(getLoadStoreType(&I));
+  if (AccessSize.isScalable())
+    return DynamicIndexResult::Scalable;
+
+  unsigned IdxWidth = DL.getIndexTypeSizeInBits(AI.getType());
+  if (IdxWidth > 64)
+    return DynamicIndexResult::UnsupportedUse;
+
+  APInt ConstOffset(IdxWidth, 0);
+  uint64_t G = 0;
+  bool MayWrap = false;
+  for (Value *V = getLoadStorePointerOperand(&I); V != &AI;) {
+    auto *GEP = dyn_cast<GEPOperator>(V);
+    if (!GEP)
+      return DynamicIndexResult::UnsupportedUse;
+    MayWrap |= !GEP->hasNoUnsignedSignedWrap();
+
+    for (gep_type_iterator GTI = gep_type_begin(GEP), E = gep_type_end(GEP);
+         GTI != E; ++GTI) {
+      Value *Idx = GTI.getOperand();
+      if (StructType *STy = GTI.getStructTypeOrNull()) {
+        unsigned Field = cast<ConstantInt>(Idx)->getZExtValue();
+        ConstOffset +=
+            DL.getStructLayout(STy)->getElementOffset(Field).getFixedValue();
+        continue;
+      }
+
+      TypeSize ElemStride = GTI.getSequentialElementStride(DL);
+      if (ElemStride.isScalable())
+        return DynamicIndexResult::Scalable;
+      uint64_t Stride = ElemStride.getFixedValue();
+      if (Stride >= (1ULL << 62))
+        return DynamicIndexResult::UnsupportedUse;
+
+      if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
+        ConstOffset += CI->getValue().sextOrTrunc(IdxWidth) * Stride;
+        continue;
+      }
+
+      // Under-approximating the known trailing zeros only adds candidates.
+      unsigned TZ = computeKnownBits(Idx, DL).countMinTrailingZeros();
+      TZ = std::min(TZ, Stride >= (1ULL << 30) ? 0u : 32u);
+      G = std::gcd(G, Stride << TZ);
+    }
+    V = GEP->getPointerOperand();
+  }
+
+  if (MayWrap)
+    ++NumDynIdxMayWrap;
+  if (MayWrap && G) {
+    G = 1ULL << llvm::countr_zero(G);
+    if (IdxWidth < 64)
+      G = std::min(G, 1ULL << IdxWidth);
+  }
+
+  if (AccessSize.getFixedValue() > AllocSize)
+    return DynamicIndexResult::Legal;
+  uint64_t Last = AllocSize - AccessSize.getFixedValue();
+  int64_t C = ConstOffset.getSExtValue();
+
+  if (G == 0) {
+    if (C >= 0 && uint64_t(C) <= Last)
+      Candidates.push_back(C);
+    return DynamicIndexResult::Legal;
+  }
+
+  uint64_t R;
+  if (C >= 0) {
+    R = uint64_t(C) % G;
+  } else {
+    uint64_t NegMod = (uint64_t(-(C + 1)) % G + 1) % G;
+    R = (G - NegMod) % G;
+  }
+
+  // A misaligned access is UB, so only offsets that are a multiple of the
+  // alignment known to hold for both the access and the alloca are live.
+  uint64_t AlignUnit =
+      std::min(getLoadStoreAlignment(&I), AI.getAlign()).value();
+  uint64_t Period = AlignUnit / std::gcd(G, AlignUnit);
+  uint64_t X = R;
+  for (uint64_t Step = 0; Step < Period && X <= Last && X % AlignUnit; ++Step)
+    X += G;
+  if (X % AlignUnit)
+    return DynamicIndexResult::Legal;
+
+  uint64_t Step = SaturatingMultiply(G, Period);
+  for (; X <= Last; X = SaturatingAdd(X, Step)) {
+    if (Candidates.size() == SROADynamicIndexMaxCandidates)
+      return DynamicIndexResult::TooManyCandidates;
+    Candidates.push_back(X);
+  }
+  return DynamicIndexResult::Legal;
+}
+
+/// Check whether an alloca whose only obstacle to SROA is dynamically indexed
+/// loads and stores could be rewritten so every access has a constant offset,
+/// with loads becoming selects over the candidate offsets and stores becoming
+/// a select-guarded store to each candidate offset.
+///
+/// TODO: This only performs the legality check and collects statistics to
+/// drive a cost model. It never modifies the IR.
+bool SROA::promoteDynamicIndex(AllocaInst &AI) {
+  const DataLayout &DL = AI.getDataLayout();
+  AllocaSlices AS(DL, AI, /*RecordDynamicAccesses=*/true);
+  ArrayRef<Instruction *> DynamicAccesses = AS.getDynamicAccesses();
+  if (DynamicAccesses.empty())
+    return false;
+
+  ++NumDynIdxAllocas;
+  LLVM_DEBUG(dbgs() << "  Dynamically indexed alloca: " << AI << "\n");
+
+  if (AS.isEscaped()) {
+    LLVM_DEBUG(dbgs() << "    Rejected: escapes\n");
+    ++NumDynIdxRejectEscape;
+    return false;
+  }
+  if (AS.isEscapedReadOnly()) {
+    LLVM_DEBUG(dbgs() << "    Rejected: escapes into read-only use\n");
+    ++NumDynIdxRejectReadOnlyEscape;
+    return false;
+  }
+
+  uint64_t AllocSize = AI.getAllocationSize(DL)->getFixedValue();
+  SmallVector<SmallVector<uint64_t, 8>, 4> AccessCandidates;
+  for (Instruction *I : DynamicAccesses) {
+    SmallVector<uint64_t, 8> &Candidates = AccessCandidates.emplace_back();
+    DynamicIndexResult Result =
+        computeDynamicIndexCandidates(DL, AI, AllocSize, *I, Candidates);
+    switch (Result) {
+    case DynamicIndexResult::Legal:
+      break;
+    case DynamicIndexResult::UnsupportedUse:
+      LLVM_DEBUG(dbgs() << "    Rejected: unsupported use " << *I << "\n");
+      ++NumDynIdxRejectUnsupportedUse;
+      return false;
+    case DynamicIndexResult::Scalable:
+      LLVM_DEBUG(dbgs() << "    Rejected: scalable type " << *I << "\n");
+      ++NumDynIdxRejectScalable;
+      return false;
+    case DynamicIndexResult::TooManyCandidates:
+      LLVM_DEBUG(dbgs() << "    Rejected: too many candidates " << *I << "\n");
+      ++NumDynIdxRejectTooManyCandidates;
+      return false;
+    }
+  }
+
+  ++NumDynIdxLegal;
+  for (auto [I, Candidates] : zip_equal(DynamicAccesses, AccessCandidates)) {
+    LLVM_DEBUG({
+      dbgs() << "    Legal: " << *I << "\n      candidates:";
+      for (uint64_t Offset : Candidates)
+        dbgs() << " " << Offset;
+      dbgs() << "\n";
+    });
+    if (isa<LoadInst>(I))
+      ++NumDynIdxLoads;
+    else
+      ++NumDynIdxStores;
+    NumDynIdxCandidates += Candidates.size();
+    MaxDynIdxCandidates.updateMax(Candidates.size());
+  }
+  return false;
+}
+
 /// Analyze an alloca for SROA.
 ///
 /// This analyzes the alloca to ensure we can reason about it, builds
@@ -6196,6 +6462,9 @@ SROA::runOnAlloca(AllocaInst &AI) {
   // Build the slices using a recursive instruction-visiting builder.
   AllocaSlices AS(DL, AI);
   LLVM_DEBUG(AS.print(dbgs()));
+  if (SROADynamicIndex && (AS.isEscaped() || AS.isEscapedReadOnly()))
+    Changed |= promoteDynamicIndex(AI);
+
   if (AS.isEscaped())
     return {Changed, CFGChanged};
 
