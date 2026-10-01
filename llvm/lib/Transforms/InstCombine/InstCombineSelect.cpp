@@ -5112,8 +5112,12 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {
   // TODO: A div/rem restriction is conservative; use something like
   //       isSafeToSpeculativelyExecute().
   // select(C, binop(select(C, X, Y), W), Z) -> select(C, binop(X, W), Z)
+  //
+  // FIXME: Test isSafeToSpeculativelyExecuteWithVariableReplaced on its own.
   BinaryOperator *TrueBO;
-  if (match(TrueVal, m_OneUse(m_BinOp(TrueBO))) && !TrueBO->isIntDivRem()) {
+  if (match(TrueVal, m_OneUse(m_BinOp(TrueBO))) &&
+      isSafeToSpeculativelyExecuteWithVariableReplaced(
+          TrueBO, /*IgnoreUBImplyingAttrs=*/false)) {
     if (auto *TrueBOSI = dyn_cast<SelectInst>(TrueBO->getOperand(0))) {
       if (TrueBOSI->getCondition() == CondVal) {
         replaceOperand(*TrueBO, 0, TrueBOSI->getTrueValue());
@@ -5132,7 +5136,9 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {
 
   // select(C, Z, binop(select(C, X, Y), W)) -> select(C, Z, binop(Y, W))
   BinaryOperator *FalseBO;
-  if (match(FalseVal, m_OneUse(m_BinOp(FalseBO))) && !FalseBO->isIntDivRem()) {
+  if (match(FalseVal, m_OneUse(m_BinOp(FalseBO))) &&
+      isSafeToSpeculativelyExecuteWithVariableReplaced(
+          FalseBO, /*IgnoreUBImplyingAttrs=*/false)) {
     if (auto *FalseBOSI = dyn_cast<SelectInst>(FalseBO->getOperand(0))) {
       if (FalseBOSI->getCondition() == CondVal) {
         replaceOperand(*FalseBO, 0, FalseBOSI->getFalseValue());
